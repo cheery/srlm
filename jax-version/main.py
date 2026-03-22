@@ -84,6 +84,8 @@ def setup(args):
         spec.BATCH = args.batch
     if args.seq_len:
         spec.SEQ_LEN = args.seq_len
+    if args.save_every:
+        spec.SAVE_EVERY = args.save_every
 
     graph = AbsorbingGraph(VOCAB_SIZE)
     noise = LogLinearNoise()
@@ -152,6 +154,7 @@ def prepare_for_train(args, s):
             (epoch, step), item = max(list(subitems(ckdir)), key=lambda x: x[0], default=((0,0),None))
             if item is not None:
                 params = checkpointer.restore(item, params)
+                print(f"Resuming checkpoint: {epoch}.{step}")
             return epoch, step, params
         else:
             checkpointer.save(ckdir / "00000.0", params)
@@ -159,6 +162,7 @@ def prepare_for_train(args, s):
 
     epoch, step, params = restore_checkpoint(s.params)
     def save_checkpoint(params, epoch, step):
+        print("Saving epoch", epoch, "step", step)
         path = ckdir / (str(epoch).zfill(5) + "." + str(step))
         if not os.path.exists(path):
             checkpointer.save(path, params)
@@ -208,8 +212,10 @@ def subitems(ckdir):
     for subitem in ckdir.iterdir():
         if subitem.name == "progress.json":
             continue
-        if "_" in subitem.name:
-            epoch_s, step_s = subitem.name.split("_")
+        if subitem.name == "loss.txt":
+            continue
+        if "." in subitem.name:
+            epoch_s, step_s = subitem.name.split(".")
             yield (int(epoch_s), int(step_s)), subitem
 
 def as_text(p):
@@ -256,6 +262,7 @@ parser.add_argument("-s", "--spec",
                     help="specification of the model (512x64, 1024x1024)")
 parser.add_argument("-l", "--seq_len", type=int)
 parser.add_argument("-b", "--batch", type=int)
+parser.add_argument("-S", "--save_every", type=int)
 subparsers = parser.add_subparsers(help='subcommand help')
 
 def train(args):
@@ -264,18 +271,21 @@ def train(args):
     sample_batch = load_kalevala(s.cwd)
     print(f"Training S5 HRM haiku model | d_model={s.spec.CONFIG.d_model}, d_state={s.spec.CONFIG.d_state}")
     print("-" * 55)
-    for epoch in range(t.epoch, 5000):
-        total_loss = 0
-        for step in range(t.step, s.spec.N_STEPS):
-            batch = sample_batch(next(s.rng), s.spec.SEQ_LEN, s.spec.BATCH)
-            session_loss = supervision_train(s, t, batch)
-            if t.step % s.spec.STEP_REPORT_EVERY == 0:
-                print(f"  step {step:4d} | loss {session_loss/s.spec.SUPERVISION:.4f}")
-            t.step += 1
-            total_loss += session_loss
-        print(f"epoch {epoch+1}, loss {total_loss / s.spec.N_STEPS / s.spec.SUPERVISION}")
-        t.step = 0
-        t.save(t.params, epoch+1, 0)
+    with open(t.ckdir / "loss.txt", "w") as loss_plot:
+        for epoch in range(t.epoch, 5000):
+            total_loss = 0
+            for step in range(t.step, s.spec.N_STEPS):
+                batch = sample_batch(next(s.rng), s.spec.SEQ_LEN, s.spec.BATCH)
+                session_loss = supervision_train(s, t, batch)
+                loss_plot.write(f"{step + epoch*s.spec.N_STEPS} {session_loss / s.spec.SUPERVISION}\n")
+                loss_plot.flush()
+                if t.step % s.spec.STEP_REPORT_EVERY == 0:
+                    print(f"  step {step:4d} | loss {session_loss/s.spec.SUPERVISION:.4f}")
+                t.step += 1
+                total_loss += session_loss
+            print(f"epoch {epoch+1}, loss {total_loss / s.spec.N_STEPS / s.spec.SUPERVISION}")
+            t.step = 0
+            t.save(t.params, epoch+1, 0)
     print("Done.")
 
 parser_train = subparsers.add_parser('train', help='train SRLM from ../../data/kalevala.plaintext.txt')
@@ -289,25 +299,28 @@ def wikitrain(args):
     print(f"-" * 55)
     resuming = loader.load_state(t.ckdir / f"progress.json")
     for epoch in range(t.epoch, 3):
-        total_loss = 0
-        if not resuming:
-            loader.shuffle(epoch)
-        resuming = False
-        while not loader.epoch_done():
-            batch = loader.next_batch() # (B, seq_len) int32, or None if epoch done
-            if batch is not None:
-                session_loss = supervision_train(s, t, batch)
-                k = loader.steps_this_epoch
-                if k % s.spec.STEP_REPORT_EVERY == 0:
-                    print(f"{k} | session loss:", session_loss / s.spec.SUPERVISION)
-                if k % s.spec.SAVE_EVERY == 0:
-                    print(f"-" * 55)
-                    t.save(t.params, t.epoch+1, loader.steps_this_epoch)
-                    loader.save_state(t.ckdir / f"progress.json")
-        print(f"last | session loss:", session_loss / s.spec.SUPERVISION)
-        print(f"epoch {epoch} done, {loader.steps_this_epoch} steps")
-        t.save(t.params, t.epoch+1, 0)
-        loader.save_state(t.ckdir / f"progress.json")
+        with open(t.ckdir / "loss.txt", "a" if resuming else "w") as loss_plot:
+            total_loss = 0
+            if not resuming:
+                loader.shuffle(epoch)
+            resuming = False
+            while not loader.epoch_done():
+                batch = loader.next_batch() # (B, seq_len) int32, or None if epoch done
+                if batch is not None:
+                    session_loss = supervision_train(s, t, batch)
+                    k = loader.steps_this_epoch
+                    loss_plot.write(f"{k} {session_loss / s.spec.SUPERVISION}\n")
+                    loss_plot.flush()
+                    if k % s.spec.STEP_REPORT_EVERY == 0:
+                        print(f"{k} | session loss:", session_loss / s.spec.SUPERVISION)
+                    if k % s.spec.SAVE_EVERY == 0:
+                        print(f"-" * 55)
+                        t.save(t.params, t.epoch, loader.steps_this_epoch)
+                        loader.save_state(t.ckdir / f"progress.json")
+            print(f"last | session loss:", session_loss / s.spec.SUPERVISION)
+            print(f"epoch {epoch} done, {loader.steps_this_epoch} steps")
+            t.save(t.params, t.epoch+1, 0)
+            loader.save_state(t.ckdir / f"progress.json")
 
 def supervision_train(s, t, batch):
     z = s.z_init
