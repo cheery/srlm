@@ -6,6 +6,7 @@ Dependencies:
     pip install dm-haiku optax jax jaxlib jmp pyarrow orbax-checkpoint
 
 """
+import dataclasses
 from dataclasses import dataclass
 import argparse
 import os
@@ -37,6 +38,9 @@ class Specification:
     SEQ_LEN : int = 32
     N_STEPS : int = 500
     SUPERVISION : int = 5
+
+    def copy(self):
+        return dataclasses.replace(self)
 
 specifications = {
         "1024x1024": Specification(
@@ -75,7 +79,11 @@ def setup(args):
     )
     hk.mixed_precision.set_policy(SRLM, policy)
 
-    spec = specifications[args.spec]
+    spec = specifications[args.spec].copy()
+    if args.batch:
+        spec.BATCH = args.batch
+    if args.seq_len:
+        spec.SEQ_LEN = args.seq_len
 
     graph = AbsorbingGraph(VOCAB_SIZE)
     noise = LogLinearNoise()
@@ -151,7 +159,9 @@ def prepare_for_train(args, s):
 
     epoch, step, params = restore_checkpoint(s.params)
     def save_checkpoint(params, epoch, step):
-        checkpointer.save(ckdir, str(epoch).zfill(5) + "." + str(step))
+        path = ckdir / (str(epoch).zfill(5) + "." + str(step))
+        if not os.path.exists(path):
+            checkpointer.save(path, params)
 
     print("Setting up optimizer, loss function, training step")
     lr_scheduler = optax.schedules.cosine_decay_schedule(1e-4, 500, 0.01)
@@ -244,6 +254,8 @@ parser.add_argument("-c", "--checkpoint", help="checkpoint directory")
 parser.add_argument("-s", "--spec",
                     default="512x64",
                     help="specification of the model (512x64, 1024x1024)")
+parser.add_argument("-l", "--seq_len", type=int)
+parser.add_argument("-b", "--batch", type=int)
 subparsers = parser.add_subparsers(help='subcommand help')
 
 def train(args):
