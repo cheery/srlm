@@ -182,7 +182,7 @@ def prepare_for_train(args, s):
             checkpointer.save(path, params)
 
     print("Setting up optimizer, loss function, training step")
-    lr_scheduler = optax.schedules.cosine_decay_schedule(1e-4, 500, 0.01)
+    lr_scheduler = optax.schedules.cosine_decay_schedule(1e-4, 26000 * 3, 0.01) # 500
     optimizer = optax.chain(
         optax.clip_by_global_norm(0.1),
         optax.zero_nans(),
