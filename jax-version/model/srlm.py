@@ -15,6 +15,7 @@ class SRLMConfig:
     d_frequency_embedding : int = 256
     N : int = 2
     T : int = 4
+    dropout : float = 0.5
 
 class SRLM(hk.Module):
     def __init__(self, cfg, name="srlm"):
@@ -28,14 +29,14 @@ class SRLM(hk.Module):
         self.norm = AdaLN(cfg.d_model)
         self.output = OutputLayer(cfg, name="output")
 
-    def __call__(self, z, x, sigma, is_training=False):
+    def __call__(self, z, x, sigma, is_training):
         cfg = self.cfg
-        q, t = self.input(x, sigma)
-        y = self.prior(q, t)
-        z, y = self.main(z, y, t)
-        y = self.posterior(y, t) + q
+        q, t = self.input(x, sigma, is_training)
+        y = self.prior(q, t, is_training)
+        z, y = self.main(z, y, t, is_training)
+        y = self.posterior(y, t, is_training) + q
         y = self.norm(y, t)
-        return z, self.output(x, y, sigma)
+        return z, self.output(x, y, sigma, is_training)
 
 class S5Stack(hk.Module):
     def __init__(self, cfg, n_layers=1, use_attention=False, name=None):
@@ -43,13 +44,14 @@ class S5Stack(hk.Module):
         self.n_layers = n_layers
         self.layers = [S5Layer(cfg, name=f"layer_{i}")
                        for i in range(n_layers)]
+        self.dropout = cfg.dropout
 
-    def __call__(self, y, t, is_training=False):
+    def __call__(self, y, t, is_training):
         for layer in self.layers:
             if is_training:
-                y = hk.dropout(hk.next_rng_key(), 0.1, layer(y, t)) + y
+                y = hk.dropout(hk.next_rng_key(), self.dropout, layer(y, t, is_training)) + y
             else:
-                y = layer(y, t) + y
+                y = layer(y, t, is_training) + y
         return y
 
 class S5Layer(hk.Module):
@@ -60,7 +62,7 @@ class S5Layer(hk.Module):
         self.norm2 = AdaLN(cfg.d_model)
         self.ff = FeedForward(cfg.d_model)
 
-    def __call__(self, y, t):
+    def __call__(self, y, t, is_training):
         @hk.remat
         def _fwd(y):
             y_norm = self.norm1(y, t)
@@ -68,11 +70,6 @@ class S5Layer(hk.Module):
             s_norm = self.norm2(s, t)
             return self.ff(s_norm)
         return _fwd(y)
-        #y_norm = self.norm1(y, t)
-        #y = jax.vmap(self.s5d)(y_norm)
-        #y_norm = self.norm2(y, t)
-        #y = self.ff(y_norm)
-        #return y
 
 class HRM(hk.Module):
     def __init__(self, cfg, name=None):
@@ -82,19 +79,19 @@ class HRM(hk.Module):
         self.fast = FastLayer(cfg, name=f"fast")
         self.slow = SlowLayer(cfg, name=f"slow")
 
-    def __call__(self, z, x, t):
+    def __call__(self, z, x, t, is_training):
         zH, zL = z
         zL = jax.lax.stop_gradient(zL)
         zH = jax.lax.stop_gradient(zH)
         for i in range(self.N * self.T - 1):
-            zL = self.fast(zH, zL, x, t)
+            zL = self.fast(zH, zL, x, t, is_training)
             if (i + 1) % self.T == 0:
-                zH = self.slow(zH, zL, t)
+                zH = self.slow(zH, zL, t, is_training)
             zL = jax.lax.stop_gradient(zL)
             zH = jax.lax.stop_gradient(zH)
 
-        zL = self.fast(zH, zL, x, t)
-        zH = self.slow(zH, zL, t)
+        zL = self.fast(zH, zL, x, t, is_training)
+        zH = self.slow(zH, zL, t, is_training)
         return (zH, zL), zH
 
 class FastLayer(hk.Module):
@@ -105,13 +102,16 @@ class FastLayer(hk.Module):
         self.inj = hk.Linear(cfg.d_model, name=f"inj")
         self.s5d = S5Dual(cfg.d_model, cfg.d_state // 4, name=f"s5d")
         #self.proj = hk.Linear(cfg.d_model)
+        self.dropout = cfg.dropout
 
-    def __call__(self, zH, zL, x, t):
+    def __call__(self, zH, zL, x, t, is_training):
         zH = self.normH(zH, t)
         zL = self.normL(zL, t)
         x = jnp.concatenate([zH, zL, x], axis=-1)
         x = self.inj(x)
         x = jax.vmap(self.s5d)(x)
+        if is_training:
+            x = hk.dropout(hk.next_rng_key(), self.dropout, x)
         #x = self.proj(x)
         return x
 
@@ -122,12 +122,15 @@ class SlowLayer(hk.Module):
         self.normH = AdaLN(cfg.d_model)
         self.s5d = S5Dual(cfg.d_model*2, cfg.d_state, name="s5d")
         self.proj = hk.Linear(cfg.d_model, name=f"proj")
+        self.dropout = cfg.dropout
 
-    def __call__(self, zH, zL, t):
+    def __call__(self, zH, zL, t, is_training):
         zH = self.normH(zH, t)
         zL = self.normL(zL, t)
         x = jnp.concatenate([zH, zL], axis=-1)
         x = jax.vmap(self.s5d)(x)
+        if is_training:
+            x = hk.dropout(hk.next_rng_key(), self.dropout, x)
         x = self.proj(x)
         return x
 
@@ -136,12 +139,15 @@ class InputLayer(hk.Module):
         super().__init__(name=name)
         self.input_emb = hk.Embed(cfg.vocab_size, cfg.d_model, name=f"input_emb")
         self.timestep_emb = TimestepEmbedder(cfg.d_model, cfg.d_frequency_embedding, name=f"timestep_emb")
+        self.dropout = cfg.dropout
 
-    def __call__(self, x, sigma, is_training=False):
+    def __call__(self, x, sigma, is_training):
         y = self.input_emb(x)
         if is_training:
-            y = hk.dropout(hk.next_rng_key(), 0.1, y)
+            y = hk.dropout(hk.next_rng_key(), self.dropout, y)
         sigma_emb = jax.nn.silu(self.timestep_emb(sigma))
+        if is_training:
+            sigma_emb = hk.dropout(hk.next_rng_key(), self.dropout, sigma_emb)
         return y, sigma_emb
 
 class OutputLayer(hk.Module):
@@ -149,11 +155,12 @@ class OutputLayer(hk.Module):
         super().__init__(name=name)
         self.ff = FeedForward(cfg.d_model, name=f"ff")
         self.proj = hk.Linear(cfg.vocab_size, with_bias=False, name=f"proj")
+        self.dropout = cfg.dropout
 
-    def __call__(self, x, y, sigma, is_training=False):
+    def __call__(self, x, y, sigma, is_training):
         y = self.ff(y)
         if is_training:
-            y = hk.dropout(hk.next_rng_key(), 0.1, y)
+            y = hk.dropout(hk.next_rng_key(), self.dropout, y)
         y = self.proj(y)
         return scatter(x, y, sigma)
 

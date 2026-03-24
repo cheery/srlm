@@ -6,6 +6,7 @@ Dependencies:
     pip install dm-haiku optax jax jaxlib jmp pyarrow orbax-checkpoint
 
 """
+import time
 import dataclasses
 from dataclasses import dataclass
 import argparse
@@ -106,11 +107,11 @@ def setup(args):
     sampler = Sampler(graph, noise)
     rng = hk.PRNGSequence(7)
 
-    def model_spec(z, x, sigma):
+    def model_spec(z, x, sigma, is_training=False):
         assert len(x.shape) == 2, x.shape
         assert len(sigma.shape) == 1, sigma.shape
         hrm = SRLM(spec.CONFIG)
-        return hrm(z, x, sigma)
+        return hrm(z, x, sigma, is_training)
     model = hk.transform(model_spec)
 
     print("initializing model...")
@@ -156,6 +157,7 @@ def prepare_for_exam(args, s):
         if item is not None:
             params = checkpointer.restore(item, params)
             print(f"epoch {epoch} at step {step}")
+    checkpointer.close()
     return params
 
 def prepare_for_train(args, s):
@@ -172,6 +174,7 @@ def prepare_for_train(args, s):
             return epoch, step, params
         else:
             checkpointer.save(ckdir / "00000.0", params)
+            checkpointer.wait_until_finished()
             return 0, 0, params
 
     epoch, step, params = restore_checkpoint(s.params)
@@ -191,11 +194,35 @@ def prepare_for_train(args, s):
     opt_state = optimizer.init(params)
     loss_fn = loss_function(s.model, s.graph, s.noise)
     @jax.jit
-    def train_step_single(key, params, opt_state, x, z):
-        (loss, z), grads = jax.value_and_grad(loss_fn, has_aux=True)(params, key, z, x)
+    def train_step_single(key, params, opt_state, x, z, t=None, p_x=None):
+        (loss, z), grads = jax.value_and_grad(loss_fn, has_aux=True)(params, key, z, x, t=t, perturbed_batch=p_x)
         updates, opt_state = optimizer.update(grads, opt_state, params)
         params = optax.apply_updates(params, updates)
         return params, opt_state, loss, z
+
+    @jax.jit
+    def train_step_ewc(key, params, opt_state, x, z, params_A, fisher_A, ewc_lambda, t=None, p_x=None):
+        def total_loss_fn(p):
+            # 1. Base Score Entropy Diffusion Loss
+            base_loss, out_z = loss_fn(p, key, z, x, t=t, perturbed_batch=p_x)
+
+            # 2. EWC Penalty
+            penalty = ewc_penalty(p, params_A, fisher_A)
+
+            # 3. Combined Loss
+            return base_loss + (ewc_lambda / 2.0) * penalty, out_z
+
+        # Take value and gradient of the COMBINED loss
+        (loss, z), grads = jax.value_and_grad(total_loss_fn, has_aux=True)(params)
+
+        updates, opt_state = optimizer.update(grads, opt_state, params)
+        new_params = optax.apply_updates(params, updates)
+
+        return new_params, opt_state, loss, z
+
+    def train_end():
+        checkpointer.close()
+        jax.effects_barrier()
 
     return Trainer(
             ckdir,
@@ -207,7 +234,9 @@ def prepare_for_train(args, s):
             opt_state,
             loss_fn,
             train_step_single,
-            save_checkpoint)
+            train_step_ewc,
+            save_checkpoint,
+            train_end)
 
 @dataclass
 class Trainer:
@@ -220,7 +249,9 @@ class Trainer:
     opt_state : Any
     loss_fn : Any
     train_step_single : Any
+    train_step_ewc : Any
     save : Any
+    end : Any
 
 def subitems(ckdir):
     for subitem in ckdir.iterdir():
@@ -286,7 +317,7 @@ def train(args):
     print(f"Training S5 HRM haiku model | d_model={s.spec.CONFIG.d_model}, d_state={s.spec.CONFIG.d_state}")
     print("-" * 55)
     with open(t.ckdir / "loss.txt", "w") as loss_plot:
-        for epoch in range(t.epoch, 5000):
+        for epoch in range(t.epoch, t.epoch+10):
             total_loss = 0
             for step in range(t.step, s.spec.N_STEPS):
                 batch = sample_batch(next(s.rng), s.spec.SEQ_LEN, s.spec.BATCH)
@@ -301,6 +332,7 @@ def train(args):
             t.step = 0
             t.save(t.params, epoch+1, 0)
     print("Done.")
+    t.end()
 
 parser_train = subparsers.add_parser('train', help='train SRLM from ../../data/kalevala.plaintext.txt')
 parser_train.set_defaults(run=train)
@@ -312,7 +344,7 @@ def wikitrain(args):
     print(f"Training S5 HRM haiku model | d_model={s.spec.CONFIG.d_model}, d_state={s.spec.CONFIG.d_state}")
     print(f"-" * 55)
     resuming = loader.load_state(t.ckdir / f"progress.json")
-    for epoch in range(t.epoch, 3):
+    for epoch in range(t.epoch, t.epoch+1):
         with open(t.ckdir / "loss.txt", "a" if resuming else "w") as loss_plot:
             total_loss = 0
             if not resuming:
@@ -335,12 +367,13 @@ def wikitrain(args):
             print(f"epoch {epoch} done, {loader.steps_this_epoch} steps")
             t.save(t.params, t.epoch+1, 0)
             loader.save_state(t.ckdir / f"progress.json")
+    t.end()
 
-def supervision_train(s, t, batch):
+def supervision_train(s, t, batch, time=None, p_batch=None):
     z = s.z_init
     session_loss = 0
     for _ in range(s.spec.SUPERVISION):
-        t.params, t.opt_state, loss, z = t.train_step_single(next(s.rng), t.params, t.opt_state, batch, z)
+        t.params, t.opt_state, loss, z = t.train_step_single(next(s.rng), t.params, t.opt_state, batch, z, time, p_batch)
         session_loss += loss
     if np.isnan(session_loss):
         print(f"Training has failed")
@@ -362,26 +395,48 @@ def wikidry(args):
             print(f"at {i}")
         i += 1
     print("total batches: ", i)
+    t.end()
 
 parser_wikidry = subparsers.add_parser('wikidry', help='dry run finnish wikipedia')
 parser_wikidry.set_defaults(run=wikidry)
 
 def evaluate(args):
     s = setup(args)
+    l = s.spec.SEQ_LEN
     params = prepare_for_exam(args, s)
     def projector(x, q):
         q = q[None,:]
         return jnp.where(q == 256, x, q)
-    fn = s.sampler.sample2(s.model.apply, projector, 1, 64)
+    fn = s.sampler.sample2(s.model.apply, projector, 1, l)
     while True:
         query = from_text(input("> "))
-        z = mk_z(1, 64, s.spec.CONFIG.d_model)
-        q = jnp.pad(query, (0, 64 - len(query)), "constant", constant_values=(256, 256))
+        z = mk_z(1, l, s.spec.CONFIG.d_model)
+        q = jnp.pad(query, (0, l - len(query)), "constant", constant_values=(256, 256))
         _, x = fn(next(s.rng), params, z, q)
         print(repr(as_text(x[0])))
+    t.end()
 
 parser_eval = subparsers.add_parser('eval', help='evaluate on model')
 parser_eval.set_defaults(run=evaluate)
+
+def evaluate_m(args):
+    s = setup(args)
+    l = s.spec.SEQ_LEN
+    params = prepare_for_exam(args, s)
+    def projector(x, q):
+        q = q[None,:]
+        return jnp.where(q == 256, x, q)
+    fn = s.sampler.sample2(s.model.apply, projector, 1, l)
+    z = mk_z(1, l, s.spec.CONFIG.d_model)
+    while True:
+        query = from_text(input("> "))
+        q = jnp.pad(query, (0, l - len(query)), "constant", constant_values=(256, 256))
+        z, x = fn(next(s.rng), params, z, q)
+        print(repr(as_text(x[0])))
+    t.end()
+
+parser_eval_m = subparsers.add_parser('evalm', help='evaluate on model with memory')
+parser_eval_m.set_defaults(run=evaluate_m)
 
 def train2(args):
     s = setup(args)
@@ -390,7 +445,7 @@ def train2(args):
     print(f"Training S5 HRM haiku model | d_model={s.spec.CONFIG.d_model}, d_state={s.spec.CONFIG.d_state}")
     print("-" * 55)
     with open(t.ckdir / "loss.txt", "w") as loss_plot:
-        for epoch in range(t.epoch, 5000):
+        for epoch in range(t.epoch, t.epoch+2):
             total_loss = 0
             for step in range(t.step, s.spec.N_STEPS // 10):
                 batch = sample_batch(next(s.rng), s.spec.SEQ_LEN, s.spec.BATCH)
@@ -414,9 +469,101 @@ def train2(args):
             t.step = 0
             t.save(t.params, epoch+1, 0)
     print("Done.")
+    t.end()
 
 parser_train2 = subparsers.add_parser('train2', help='train SRLM from ../../data/kalevala.plaintext.txt with different method.')
 parser_train2.set_defaults(run=train2)
+
+def make_arithmetic_puzzle(key, batch_len, batch_size):
+    key, key_1 = jax.random.split(key)
+    key, key_2 = jax.random.split(key)
+    batch = []
+    p_batch = []
+    for k in range(batch_size):
+        i_1 = jax.random.randint(key_1, (), 0, 100000, dtype=jnp.int32)
+        i_2 = jax.random.randint(key_2, (), 0, 100000, dtype=jnp.int32)
+        data = from_text(f"{i_1}+{i_2}={str(i_1+i_2)}")
+        p_data = from_text(f"{i_1}+{i_2}=")
+        data = jnp.pad(data, (0, batch_len - len(data)), constant_values=(0, 0))
+        p_data = jnp.pad(p_data, (0, batch_len - len(p_data)), constant_values=(256, 256))
+        batch.append(data)
+        p_batch.append(p_data)
+    return jnp.stack(batch), jnp.stack(p_batch)
+
+def train_arithmetic(args):
+    s = setup(args)
+    t = prepare_for_train(args, s)
+    sample_batch = load_kalevala(s.cwd)
+    print(f"Training S5 HRM haiku model | d_model={s.spec.CONFIG.d_model}, d_state={s.spec.CONFIG.d_state}")
+    print("-" * 55)
+    with open(t.ckdir / "loss.txt", "w") as loss_plot:
+        for epoch in range(t.epoch, t.epoch+2):
+            total_loss = 0
+            for step in range(s.spec.N_STEPS):
+                batch, p_batch = make_arithmetic_puzzle(next(s.rng), s.spec.SEQ_LEN, s.spec.BATCH)
+
+                #session_loss = 0
+                #for _ in range(s.spec.SUPERVISION):
+                #    t.params, t.opt_state, loss, z = t.train_step_ewc(
+                #        next(s.rng),
+                #        t.params,
+                #        t.opt_state,
+                #        batch,
+                #        z,
+                #        params_A,         # <--- Frozen Task A weights
+                #        fisher_A,         # <--- Task A parameter importance
+                #        ewc_lambda=100.0, # <--- Tune this!
+                #        t=time,
+                #        p_x=p_batch
+                #    )
+                #    session_loss += loss
+                session_loss = supervision_train(s, t, batch, p_batch=p_batch)
+                loss_plot.write(f"{step + epoch*s.spec.N_STEPS} {session_loss / s.spec.SUPERVISION}\n")
+                loss_plot.flush()
+                if t.step % s.spec.STEP_REPORT_EVERY == 0:
+                    print(f"  step {step:4d} | loss {session_loss/s.spec.SUPERVISION:.4f}")
+                t.step += 1
+                total_loss += session_loss
+            print(f"epoch {epoch+1}, loss {total_loss / s.spec.N_STEPS / s.spec.SUPERVISION}")
+            t.step = 0
+            t.save(t.params, epoch+1, 0)
+    print("Done.")
+    t.end()
+
+parser_train2 = subparsers.add_parser('train_arithmetic', help='train SRLM from ../../data/kalevala.plaintext.txt with different method.')
+parser_train2.set_defaults(run=train_arithmetic)
+
+
+def compute_empirical_fisher(s, t_trainer, data_loader, num_batches=200):
+    print("Computing Fisher Information Matrix...")
+
+    # Initialize Fisher PyTree with zeros (same shape as params)
+    fisher = jax.tree_util.tree_map(jnp.zeros_like, t_trainer.params)
+
+    @jax.jit
+    def get_squared_grads(params, key, z, batch):
+        # We only want the gradient of the loss scalar, so we index [0]
+        # to ignore the auxiliary 'z' state returned by loss_fn
+        grad_fn = jax.grad(lambda p: t_trainer.loss_fn(p, key, z, batch)[0])
+        grads = grad_fn(params)
+        return jax.tree_util.tree_map(jnp.square, grads)
+
+    for i in range(num_batches):
+        batch = data_loader()
+        if batch is None:
+            break
+
+        sq_grads = get_squared_grads(t_trainer.params, next(s.rng), s.z_init, batch)
+
+        # Accumulate the moving average
+        fisher = jax.tree_util.tree_map(
+            lambda f, g: f + (g / num_batches), fisher, sq_grads
+        )
+
+        if (i + 1) % 50 == 0:
+            print(f"  Fisher computation: {i + 1}/{num_batches} batches done.")
+
+    return fisher
 
 def param_memory_mb(params):
     leaves = jax.tree_util.tree_leaves(params)

@@ -1,8 +1,23 @@
 import jax
 import jax.numpy as jnp
 
+def ewc_penalty(params, params_A, fisher_A):
+    """Calculates the EWC penalty across the entire PyTree."""
+    def compute_layer_penalty(p, p_A, f_A):
+        # (Fisher * (theta - theta_A)^2)
+        return jnp.sum(f_A * jnp.square(p - p_A))
+
+    # Apply to all corresponding leaves in the parameter dictionaries
+    penalties = jax.tree_util.tree_map(
+        compute_layer_penalty, params, params_A, fisher_A
+    )
+
+    # Sum all penalties into a single scalar
+    total_penalty = jax.tree_util.tree_reduce(lambda a, b: a + b, penalties, 0.0)
+    return total_penalty
+
 def loss_function(model, graph, noise):
-    def sedd_hrm_loss(params, key, z, batch, t=None, perturbed_batch=None):
+    def sedd_hrm_loss(params, key, z, batch, t=None, perturbed_batch=None, is_training=True):
         sampling_eps = 1e-3
 
         if t is None:
@@ -15,7 +30,7 @@ def loss_function(model, graph, noise):
             key, trans_key = jax.random.split(key)
             perturbed_batch = graph.sample_transition(trans_key, batch, sigma[:, None])
 
-        z, log_score = model.apply(params, key, z, perturbed_batch, sigma)
+        z, log_score = model.apply(params, key, z, perturbed_batch, sigma, is_training)
         loss = graph.score_entropy(log_score, sigma[:, None], perturbed_batch, batch)
         loss = (dsigma[:, None] * loss).sum(axis=-1)
 
