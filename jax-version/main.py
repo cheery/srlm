@@ -220,6 +220,21 @@ def prepare_for_train(args, s):
 
         return new_params, opt_state, loss, z
 
+    arith_lr_scheduler = optax.schedules.cosine_decay_schedule(1e-5, 26000 * 3, 0.01)
+    arith_optimizer = optax.chain(
+        optax.clip_by_global_norm(0.1),
+        optax.zero_nans(),
+        optax.adamw(arith_lr_scheduler, weight_decay=0.01),
+    )
+    arith_opt_state = arith_optimizer.init(params)
+
+    @jax.jit
+    def train_step_arith(key, params, opt_state, x, z, t=None, p_x=None):
+        (loss, z), grads = jax.value_and_grad(loss_fn, has_aux=True)(params, key, z, x, t=t, perturbed_batch=p_x)
+        updates, opt_state = arith_optimizer.update(grads, opt_state, params)
+        params = optax.apply_updates(params, updates)
+        return params, opt_state, loss, z
+
     def train_end():
         checkpointer.close()
         jax.effects_barrier()
@@ -232,9 +247,12 @@ def prepare_for_train(args, s):
             params,
             optimizer,
             opt_state,
+            arith_optimizer,
+            arith_opt_state,
             loss_fn,
             train_step_single,
             train_step_ewc,
+            train_step_arith,
             save_checkpoint,
             train_end)
 
@@ -247,9 +265,12 @@ class Trainer:
     params : Any
     optimizer : Any
     opt_state : Any
+    arith_optimizer : Any
+    arith_opt_state : Any
     loss_fn : Any
     train_step_single : Any
     train_step_ewc : Any
+    train_step_arith : Any
     save : Any
     end : Any
 
@@ -380,6 +401,17 @@ def supervision_train(s, t, batch, time=None, p_batch=None):
         sys.exit(0)
     return session_loss
 
+def arith_supervision_train(s, t, batch, time=None, p_batch=None):
+    z = s.z_init
+    session_loss = 0
+    for _ in range(s.spec.SUPERVISION):
+        t.params, t.arith_opt_state, loss, z = t.train_step_arith(next(s.rng), t.params, t.arith_opt_state, batch, z, time, p_batch)
+        session_loss += loss
+    if np.isnan(session_loss):
+        print(f"Training has failed")
+        sys.exit(0)
+    return session_loss
+
 parser_wikitrain = subparsers.add_parser('wikitrain', help='train from finnish wikipedia')
 parser_wikitrain.set_defaults(run=wikitrain)
 
@@ -475,11 +507,11 @@ parser_train2 = subparsers.add_parser('train2', help='train SRLM from ../../data
 parser_train2.set_defaults(run=train2)
 
 def make_arithmetic_puzzle(key, batch_len, batch_size):
-    key, key_1 = jax.random.split(key)
-    key, key_2 = jax.random.split(key)
     batch = []
     p_batch = []
     for k in range(batch_size):
+        key, key_1 = jax.random.split(key)
+        key, key_2 = jax.random.split(key)
         i_1 = jax.random.randint(key_1, (), 0, 100000, dtype=jnp.int32)
         i_2 = jax.random.randint(key_2, (), 0, 100000, dtype=jnp.int32)
         data = from_text(f"{i_1}+{i_2}={str(i_1+i_2)}")
@@ -517,7 +549,7 @@ def train_arithmetic(args):
                 #        p_x=p_batch
                 #    )
                 #    session_loss += loss
-                session_loss = supervision_train(s, t, batch, p_batch=p_batch)
+                session_loss = arith_supervision_train(s, t, batch, p_batch=p_batch)
                 loss_plot.write(f"{step + epoch*s.spec.N_STEPS} {session_loss / s.spec.SUPERVISION}\n")
                 loss_plot.flush()
                 if t.step % s.spec.STEP_REPORT_EVERY == 0:
