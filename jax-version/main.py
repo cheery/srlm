@@ -79,6 +79,24 @@ specifications = {
                               n_priors=3, n_posteriors=2,
                               use_attention=True, n_heads=8, context_length=128),
             SEQ_LEN=128),
+        "768h12c128": Specification(
+            CONFIG=SRLMConfig(vocab_size = TOTAL_VOCAB,
+                              d_model = 768, d_state = 512,
+                              n_priors=2, n_posteriors=2,
+                              use_attention=True, n_heads=12, context_length=128),
+            SEQ_LEN=128),
+        "512x64rd": Specification(
+            CONFIG=SRLMConfig(vocab_size = TOTAL_VOCAB,
+                              d_model = 512, d_state = 64,
+                              n_priors=4, n_posteriors=4, use_attn_residual=True, use_adaln_in_residual=True)),
+        "1024x8r": Specification(
+            CONFIG=SRLMConfig(vocab_size = TOTAL_VOCAB,
+                              d_model = 1024, d_state = 8,
+                              n_priors=3, n_posteriors=2, use_attn_residual=True, use_adaln_in_residual=True)),
+        "512x8r": Specification(
+            CONFIG=SRLMConfig(vocab_size = TOTAL_VOCAB,
+                              d_model = 512, d_state = 8,
+                              n_priors=4, n_posteriors=2, use_attn_residual=True, use_adaln_in_residual=True)),
 }
 
 
