@@ -36,7 +36,7 @@ class EulerPredictor:
         sigma, dsigma = self.noise(t)
         key, score_key = jax.random.split(key)
         arg, log_score = score_fn(params, score_key, arg, x, sigma)
-        return arg, self.predict(key, x, log_score, dsigma)
+        return arg, self.predict(key, x, log_score, dsigma, step_size)
 
     def predict(self, key, x, log_score, dsigma, step_size):
         score = jnp.exp(log_score)
@@ -158,7 +158,7 @@ class Sampler:
         """
         try:
             key, limit_key = jax.random.split(key)
-            x = graph.sample_limit2(limit_key, batch_size, bacth_len)
+            x = self.graph.sample_limit2(limit_key, batch_size, batch_len)
             timesteps = jnp.linspace(1.0, eps, steps + 1)
             dt = (1 - eps) / steps
 

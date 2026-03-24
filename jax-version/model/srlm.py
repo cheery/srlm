@@ -4,6 +4,7 @@ import jax.numpy as jnp
 import haiku as hk
 import math
 from .s5 import S5Dual
+from .attn import Attention, AttnResidual
 
 @dataclass
 class SRLMConfig:
@@ -16,6 +17,16 @@ class SRLMConfig:
     N : int = 2
     T : int = 4
     dropout : float = 0.5
+    # Attention-based alternative to S5Dual.
+    # When True, S5Dual is replaced by multi-head attention with learned positional
+    # encoding capped at context_length.  n_heads must divide d_model.
+    use_attention : bool = False
+    context_length : int = 512
+    n_heads : int = 8
+    # Replace plain residual addition in S5Stack with inter-block attention residuals.
+    # Each layer input becomes a learned weighted blend of all prior block states.
+    use_attn_residual : bool = False
+    use_adaln_in_residual : bool = False
 
 class SRLM(hk.Module):
     def __init__(self, cfg, name="srlm"):
@@ -28,13 +39,19 @@ class SRLM(hk.Module):
         self.posterior = S5Stack(cfg, cfg.n_posteriors, use_attention=False, name="posterior")
         self.norm = AdaLN(cfg.d_model)
         self.output = OutputLayer(cfg, name="output")
+        if cfg.use_attn_residual:
+            self.stage_res = AttnResidual(cfg.d_model, cfg.use_adaln_in_residual, name="stage_res")
 
     def __call__(self, z, x, sigma, is_training):
         cfg = self.cfg
         q, t = self.input(x, sigma, is_training)
         y = self.prior(q, t, is_training)
         z, y = self.main(z, y, t, is_training)
-        y = self.posterior(y, t, is_training) + q
+        y = self.posterior(y, t, is_training)
+        if cfg.use_attn_residual:
+            y = self.stage_res([q], y, t)
+        else:
+            y = y + q
         y = self.norm(y, t)
         return z, self.output(x, y, sigma, is_training)
 
@@ -42,34 +59,75 @@ class S5Stack(hk.Module):
     def __init__(self, cfg, n_layers=1, use_attention=False, name=None):
         super().__init__(name=name)
         self.n_layers = n_layers
-        self.layers = [S5Layer(cfg, name=f"layer_{i}")
+        # use_attention is passed explicitly so SRLM can force S5 for prior/posterior
+        # even when cfg.use_attention=True (for the HRM layers).
+        self.layers = [S5Layer(cfg, use_attention=use_attention, name=f"layer_{i}")
                        for i in range(n_layers)]
         self.dropout = cfg.dropout
+        self.use_attn_residual = cfg.use_attn_residual
+        if cfg.use_attn_residual:
+            self.attn_res = [AttnResidual(cfg.d_model, cfg.use_adaln_in_residual, name=f"attn_res_{i}")
+                             for i in range(n_layers)]
 
     def __call__(self, y, t, is_training):
-        for layer in self.layers:
-            if is_training:
-                y = hk.dropout(hk.next_rng_key(), self.dropout, layer(y, t, is_training)) + y
-            else:
-                y = layer(y, t, is_training) + y
-        return y
+        if self.use_attn_residual:
+            blocks = []
+            partial = y
+            for i, layer in enumerate(self.layers):
+                h = self.attn_res[i](blocks, partial, t)
+                out = layer(h, t, is_training)
+                # out = h + learned_deltas; subtract h to accumulate only the deltas
+                delta = out - h
+                if is_training:
+                    delta = hk.dropout(hk.next_rng_key(), self.dropout, delta)
+                partial = partial + delta
+                blocks.append(partial)
+            return partial
+        else:
+            # S5Layer has internal residuals (DiT-style); no external +y needed.
+            for layer in self.layers:
+                out = layer(y, t, is_training)
+                if is_training:
+                    out = hk.dropout(hk.next_rng_key(), self.dropout, out)
+                y = out
+            return y
 
 class S5Layer(hk.Module):
-    def __init__(self, cfg, name=None):
+    def __init__(self, cfg, use_attention=False, name=None):
         super().__init__(name=name)
-        self.norm1 = AdaLN(cfg.d_model)
-        self.s5d = S5Dual(cfg.d_model, cfg.d_state, name="s5d")
+        self.m = hk.Linear(6 * cfg.d_model, w_init=jnp.zeros)
+        if use_attention:
+            self.s5d = Attention(cfg.d_model, cfg.context_length, cfg.n_heads, name="attn")
+        else:
+            self.s5d = jax.vmap(S5Dual(cfg.d_model, cfg.d_state, name="s5d"))
         self.norm2 = AdaLN(cfg.d_model)
         self.ff = FeedForward(cfg.d_model)
 
     def __call__(self, y, t, is_training):
         @hk.remat
         def _fwd(y):
-            y_norm = self.norm1(y, t)
-            s = jax.vmap(self.s5d)(y_norm)
-            s_norm = self.norm2(s, t)
-            return self.ff(s_norm)
+            shift_a, scale_a, gate_a, shift_ff, scale_ff, gate_ff = jnp.split(self.m(t), 6, axis=-1)
+
+            y_norm = hk.LayerNorm(axis=-1, create_scale=False, create_offset=False)(y)
+            y_modulated = modulate(y_norm, shift_a, scale_a)
+            a_y = self.s5d(y_modulated)
+            y = y + (gate_a[:, None] * a_y)
+
+            y_norm = hk.LayerNorm(axis=-1, create_scale=False, create_offset=False)(y)
+            y_modulated = modulate(y_norm, shift_ff, scale_ff)
+            ff_y = self.ff(y_modulated)
+            y = y + (gate_ff[:, None] * ff_y)
+            return y
+        #@hk.remat
+        #def _fwd(y):
+        #    y_norm = self.norm1(y, t)
+        #    s = jax.vmap(self.s5d)(y_norm)
+        #    s_norm = self.norm2(s, t)
+        #    return self.ff(s_norm)
         return _fwd(y)
+
+def modulate(x, shift, scale):
+    return x * (1 + scale[:, None]) + shift[:, None]
 
 class HRM(hk.Module):
     def __init__(self, cfg, name=None):
@@ -100,7 +158,10 @@ class FastLayer(hk.Module):
         self.normL = AdaLN(cfg.d_model)
         self.normH = AdaLN(cfg.d_model)
         self.inj = hk.Linear(cfg.d_model, name=f"inj")
-        self.s5d = S5Dual(cfg.d_model, cfg.d_state // 4, name=f"s5d")
+        if cfg.use_attention:
+            self.s5d = Attention(cfg.d_model, cfg.context_length, cfg.n_heads, name="attn")
+        else:
+            self.s5d = jax.vmap(S5Dual(cfg.d_model, cfg.d_state // 4, name=f"s5d"))
         #self.proj = hk.Linear(cfg.d_model)
         self.dropout = cfg.dropout
 
@@ -109,7 +170,7 @@ class FastLayer(hk.Module):
         zL = self.normL(zL, t)
         x = jnp.concatenate([zH, zL, x], axis=-1)
         x = self.inj(x)
-        x = jax.vmap(self.s5d)(x)
+        x = self.s5d(x)
         if is_training:
             x = hk.dropout(hk.next_rng_key(), self.dropout, x)
         #x = self.proj(x)
@@ -120,7 +181,12 @@ class SlowLayer(hk.Module):
         super().__init__(name=name)
         self.normL = AdaLN(cfg.d_model)
         self.normH = AdaLN(cfg.d_model)
-        self.s5d = S5Dual(cfg.d_model*2, cfg.d_state, name="s5d")
+        self.has_inj = cfg.use_attention
+        if cfg.use_attention:
+            # d_model*2 is the feature dim here; n_heads divides it since it divides d_model
+            self.s5d = Attention(cfg.d_model * 2, cfg.context_length, cfg.n_heads, name="attn")
+        else:
+            self.s5d = jax.vmap(S5Dual(cfg.d_model*2, cfg.d_state, name="s5d"))
         self.proj = hk.Linear(cfg.d_model, name=f"proj")
         self.dropout = cfg.dropout
 
@@ -128,7 +194,9 @@ class SlowLayer(hk.Module):
         zH = self.normH(zH, t)
         zL = self.normL(zL, t)
         x = jnp.concatenate([zH, zL], axis=-1)
-        x = jax.vmap(self.s5d)(x)
+        if self.has_inj:
+            x = hk.Linear(x.shape[-1], name=f"inj")(x)
+        x = self.s5d(x)
         if is_training:
             x = hk.dropout(hk.next_rng_key(), self.dropout, x)
         x = self.proj(x)

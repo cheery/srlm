@@ -24,7 +24,7 @@ import math
 from jax.lax import associative_scan
 from orbax import checkpoint as ocp
 from pathlib import Path
-from model import SRLMConfig, SRLM, AbsorbingGraph, LogLinearNoise, Sampler, mk_z, loss_function
+from model import SRLMConfig, SRLM, AbsorbingGraph, LogLinearNoise, Sampler, mk_z, loss_function, ewc_penalty
 from typing import Any
 
 VOCAB_SIZE = 256
@@ -68,7 +68,17 @@ specifications = {
         "512x64": Specification(
             CONFIG=SRLMConfig(vocab_size = TOTAL_VOCAB,
                               d_model = 512, d_state = 64,
-                              n_priors=3, n_posteriors=2))
+                              n_priors=3, n_posteriors=2)),
+        "512x64r": Specification(
+            CONFIG=SRLMConfig(vocab_size = TOTAL_VOCAB,
+                              d_model = 512, d_state = 64,
+                              n_priors=3, n_posteriors=2, use_attn_residual=True, use_adaln_in_residual=True)),
+        "512h8c128": Specification(
+            CONFIG=SRLMConfig(vocab_size = TOTAL_VOCAB,
+                              d_model = 512, d_state = 512,
+                              n_priors=3, n_posteriors=2,
+                              use_attention=True, n_heads=8, context_length=128),
+            SEQ_LEN=128),
 }
 
 
@@ -101,6 +111,13 @@ def setup(args):
         spec.SEQ_LEN = args.seq_len
     if args.save_every:
         spec.SAVE_EVERY = args.save_every
+
+    cfg = spec.CONFIG
+    if cfg.use_attention:
+        assert spec.SEQ_LEN <= cfg.context_length, (
+            f"SEQ_LEN={spec.SEQ_LEN} exceeds context_length={cfg.context_length}; "
+            f"attention positional embeddings only cover up to context_length positions."
+        )
 
     graph = AbsorbingGraph(VOCAB_SIZE)
     noise = LogLinearNoise()
