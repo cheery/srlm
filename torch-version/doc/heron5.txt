@@ -1,0 +1,133 @@
+Here's a demonstration of heron5, 10M parameter, 40MB language model.
+
+Device: cuda
+Initialising model...
+  Loaded: /home/cheery/ai/2026/srlm/torch-version/heron5/parameters.pt
+> nopea kuin rasvattu salama
+nopea kuin rasvattu salamansiona mautkk' e me!- Ylänoiä�tsikkyvyvättmänyyttä. ksuiti tuokuni ku Una kait  he. Ses emp'  kurta kanoi!  jsetsanopi a loutuissa meta."  tuulile!"  Me  oljote  teni ortto ,   en aroaivo lan '   mitetä   tevu  Kun oh''en mi
+> kauneutta katsojan silmässä
+kauneutta katsojan silmässäeltin  peula8 memat klta kaaisikki Ikistusiellus etomma nutti, ymeliksi lununa!  "Mntö8   ailta aren oaivo: "  Ismass'    sese            Liempyi ken  Täin ehi:          e   e  aattoani:  ranule?  vuvuella kykki goi, viunekse
+> 
+3ps215n69om u=8kens   s syik  3 sevä  29nnilk4 85i, atikun sop�a sanoiksi   �   ahsks   Lnuvets?    uv            t   J   "    "h 6  no sei iet!       uu   Atte     Siiet                              a      an eme           i te           San ylev  Yhsys�
+> 
+, e'   Uohkottei, opullesekuoi kuvan htiet       "esutti, sulilmmöikselesi, synni tytä pullet, eit jossa  Oi aikki         o, ta vainoi, kullevultan nepilikko       Kunnehet mmo, kyäsint           ki   Surhin sarppo rusia vieaoat en isoi käson tuovas  
+> 1+4=
+1+4=56                                                                                                                                                                                                                                                          
+> 1+53=
+1+53=32                                                                                                                                                                                                                                                         
+> 1+1=
+1+1=7755                                                                                                                                                                                                                                                        
+> !sudoku
+Loaded 49000 puzzles
+
+Puzzle #14599 (30 blanks):
+736..8425
+....2.736
+.2.7.6.18
+3.4.67..9
+..9354.67
+.672.935.
+.926.3...
+871592643
+6....1592
+
+Model output:
+736578425
+459421736
+123746518
+314567299
+129354867
+467289354
+392673175
+871592643
+644561592
+
+Score: 6/30 blanks correct (20%)
+
+Solution:
+736918425
+918425736
+425736918
+354167289
+289354167
+167289354
+592643871
+871592643
+643871592
+
+> !sudoku
+
+Puzzle #15800 (47 blanks):
+..5...27.
+.16..2.5.
+....84..9
+16....5.4
+..381.792
+..9...6.1
+79....8.6
+6..1..325
+.......17
+
+Model output:
+165498274
+916832454
+725584639
+162793534
+453816792
+569372641
+794667826
+654189325
+854896217
+
+Score: 13/47 blanks correct (28%)
+
+Solution:
+845691273
+916732458
+327584169
+168927534
+453816792
+279345681
+791253846
+684179325
+532468917
+
+> !sudoku
+
+Puzzle #22203 (47 blanks):
+...6873..
+.7......5
+8...31.94
+..9..8.6.
+45..1....
+73..562..
+6.....823
+5.1.9..7.
+..72.4..9
+
+Model output:
+449687316
+271k94375
+835431494
+769058369
+453615973
+738956241
+659347823
+581395872
+377264119
+
+Score: 10/47 blanks correct (21%)
+
+Solution:
+945687312
+173429685
+862531794
+219348567
+456712938
+738956241
+694175823
+521893476
+387264159
+
+> 
+
