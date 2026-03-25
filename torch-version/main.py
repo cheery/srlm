@@ -443,11 +443,17 @@ def cmd_train(args):
     else:
         scheduler = cosine_scheduler
 
-    # Memory bank (Anki-style rolling recall)
+    # Memory bank (Anki-style rolling recall with alternation)
     use_memory = args.memory_size > 0
+    memory_alternate = args.memory_alternate
     if use_memory:
         memory_bank = MemoryBank()
-        print(f"Memory bank: size={args.memory_size}, k={args.memory_k}, refresh every {args.memory_refresh}")
+        if memory_alternate > 0:
+            print(f"Memory bank: size={args.memory_size}, k={args.memory_k}, "
+                  f"refresh every {args.memory_refresh}, alternate every {memory_alternate}")
+        else:
+            print(f"Memory bank: size={args.memory_size}, k={args.memory_k}, "
+                  f"refresh every {args.memory_refresh}")
 
     print(f"Training | programs: {[p.description() for p in programs]}")
     print("-" * 55)
@@ -481,28 +487,31 @@ def cmd_train(args):
                 continue
             batch, perturbed_batch = result
 
-            # Store this batch in the memory bank
+            # Determine if memory is active this step (alternation)
+            if use_memory and memory_alternate > 0:
+                memory_active = ((global_step // memory_alternate) % 2) == 0
+            else:
+                memory_active = use_memory
+
+            # Store this batch in the memory bank (always, even during off phase)
             if use_memory:
                 model.eval()
                 memory_bank.encode(model, [batch], device)
                 model.train()
-                # Drop oldest if over capacity
                 while len(memory_bank) > args.memory_size:
                     memory_bank.tokens.pop(0)
                     memory_bank.memories.pop(0)
                     memory_bank.summaries.pop(0)
 
-            # Anki: randomly replay a past batch, retrieve relevant memories
-            if use_memory and len(memory_bank) >= args.memory_k + 1:
+            # Anki: replay with memories during on-phase, fresh without during off-phase
+            memories = None
+            if memory_active and len(memory_bank) >= args.memory_k + 1:
                 idx = torch.randint(0, len(memory_bank), ()).item()
                 batch = memory_bank.tokens[idx].to(device)
                 perturbed_batch = None
-                # Route to find relevant memories (target's own memory will score high)
                 with torch.no_grad():
                     query = model.input.input_emb(batch.clamp(0, config.vocab_size - 1))
                 memories = memory_bank.retrieve(query, args.memory_k)
-            else:
-                memories = None
 
             # Run supervision steps
             z = make_z(batch_size, seq_len, config.d_model, device=device)
@@ -524,7 +533,11 @@ def cmd_train(args):
 
             if global_step % report_every == 0:
                 avg = running_loss / report_every
-                mem_info = f" | mem {len(memory_bank)}" if use_memory else ""
+                if use_memory:
+                    phase = "study" if memory_active else "practice"
+                    mem_info = f" | {phase} ({len(memory_bank)})"
+                else:
+                    mem_info = ""
                 print(f"  step {global_step:6d} | loss {avg:.4f} | lr {scheduler.get_last_lr()[0]:.2e}{mem_info}")
                 running_loss = 0.0
 
@@ -676,6 +689,8 @@ def main():
                          help="Number of memories to retrieve per step (default: 2)")
     p_train.add_argument("--memory-refresh", type=int, default=100, dest="memory_refresh",
                          help="Re-encode memory bank every N steps (default: 100)")
+    p_train.add_argument("--memory-alternate", type=int, default=0, dest="memory_alternate",
+                         help="Alternate memory on/off every N steps (0 = always on, default: 0)")
 
     # --- eval ---
     p_eval = sub.add_parser("eval", help="Interactive evaluation")
