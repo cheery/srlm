@@ -45,6 +45,16 @@ DEFAULT_CONFIG = SRLMConfig(
     n_heads        = 8,
 )
 
+MEDIUM_CONFIG = SRLMConfig(
+    vocab_size     = TOTAL_VOCAB,
+    context_length = 256,
+    d_model        = 1152,
+    n_priors       = 3,
+    n_posteriors   = 2,
+    n_heads        = 16,
+    dropout        = 0.2,
+)
+
 # ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
@@ -344,16 +354,21 @@ def cmd_train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    # Resolve config: load from checkpoint if it exists, else use default
+    # Resolve config: checkpoint > preset flag > default
     ckpt_path = cwd / args.checkpoint
-    config = load_config(ckpt_path) or DEFAULT_CONFIG
+    base = load_config(ckpt_path)
+    if base is None:
+        base = MEDIUM_CONFIG if args.medium else DEFAULT_CONFIG
     config = SRLMConfig(
-        vocab_size       = config.vocab_size,
-        context_length   = args.seq_len or config.context_length,
-        d_model          = config.d_model,
-        n_priors         = config.n_priors,
-        n_posteriors     = config.n_posteriors,
-        n_heads          = config.n_heads,
+        vocab_size       = base.vocab_size,
+        context_length   = args.seq_len or base.context_length,
+        d_model          = args.d_model or base.d_model,
+        n_priors         = args.n_priors if args.n_priors is not None else base.n_priors,
+        n_posteriors     = args.n_posteriors if args.n_posteriors is not None else base.n_posteriors,
+        n_heads          = args.n_heads or base.n_heads,
+        dropout          = args.dropout if args.dropout is not None else base.dropout,
+        N                = args.N if args.N is not None else base.N,
+        T                = args.T if args.T is not None else base.T,
     )
 
     seq_len     = config.context_length
@@ -574,6 +589,23 @@ def main():
                          help="Enable QA training (0 or omit count = indefinite)")
     p_train.add_argument("--qa-file", type=str, default="../../data/finnish_qa_663.jsonl",
                          help="Path to JSONL file with question/answer fields")
+    # Model config presets and overrides
+    p_train.add_argument("--medium", action="store_true",
+                         help="Use medium config (~200M params, dropout=0.2)")
+    p_train.add_argument("--d-model", type=int, default=None, dest="d_model",
+                         help="Override d_model")
+    p_train.add_argument("--n-priors", type=int, default=None, dest="n_priors",
+                         help="Override number of prior layers")
+    p_train.add_argument("--n-posteriors", type=int, default=None, dest="n_posteriors",
+                         help="Override number of posterior layers")
+    p_train.add_argument("--n-heads", type=int, default=None, dest="n_heads",
+                         help="Override number of attention heads")
+    p_train.add_argument("--dropout", type=float, default=None,
+                         help="Override dropout rate")
+    p_train.add_argument("--N", type=int, default=None,
+                         help="Override HRM N (outer iterations)")
+    p_train.add_argument("--T", type=int, default=None,
+                         help="Override HRM T (inner iterations per slow step)")
     p_train.add_argument("--save-every", type=int, default=1000,
                          help="Save checkpoint every N global steps (default: 1000)")
     p_train.add_argument("--report-every", type=int, default=10,
