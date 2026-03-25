@@ -468,15 +468,29 @@ def cmd_train(args):
             if all(p.done() for p in programs):
                 break
 
-            # Round-robin: pick next non-done program
-            attempts = 0
-            while programs[program_idx].done():
-                program_idx = (program_idx + 1) % len(programs)
-                attempts += 1
+            # Pick next program: interleave or sequential
+            if args.interleave > 0 and len(programs) > 1:
+                # Switch program every N steps
+                program_idx = (global_step // args.interleave) % len(programs)
+                # Skip done programs
+                attempts = 0
+                while programs[program_idx].done():
+                    program_idx = (program_idx + 1) % len(programs)
+                    attempts += 1
+                    if attempts > len(programs):
+                        break
                 if attempts > len(programs):
                     break
-            if attempts > len(programs):
-                break
+            else:
+                # Sequential: stay on current until done
+                attempts = 0
+                while programs[program_idx].done():
+                    program_idx = (program_idx + 1) % len(programs)
+                    attempts += 1
+                    if attempts > len(programs):
+                        break
+                if attempts > len(programs):
+                    break
 
             program = programs[program_idx]
 
@@ -538,7 +552,8 @@ def cmd_train(args):
                     mem_info = f" | {phase} ({len(memory_bank)})"
                 else:
                     mem_info = ""
-                print(f"  step {global_step:6d} | loss {avg:.4f} | lr {scheduler.get_last_lr()[0]:.2e}{mem_info}")
+                prog_name = program.description().split("(")[0]
+                print(f"  step {global_step:6d} | loss {avg:.4f} | {prog_name} | lr {scheduler.get_last_lr()[0]:.2e}{mem_info}")
                 running_loss = 0.0
 
             # Periodic memory refresh — re-encode with improved model
@@ -681,8 +696,8 @@ def main():
                          help="Sequence length (default: from config)")
     p_train.add_argument("--lr", type=float, default=1e-4,
                          help="Learning rate (default: 1e-4)")
-    p_train.add_argument("--warmup-steps", type=int, default=100, dest="warmup_steps",
-                         help="Linear LR warmup steps (default: 100)")
+    p_train.add_argument("--warmup-steps", type=int, default=0, dest="warmup_steps",
+                         help="Linear LR warmup steps (default: off)")
     p_train.add_argument("--memory-size", type=int, default=0, dest="memory_size",
                          help="Rolling memory bank size (0 = disabled, default: 0)")
     p_train.add_argument("--memory-k", type=int, default=2, dest="memory_k",
@@ -691,6 +706,8 @@ def main():
                          help="Re-encode memory bank every N steps (default: 100)")
     p_train.add_argument("--memory-alternate", type=int, default=0, dest="memory_alternate",
                          help="Alternate memory on/off every N steps (0 = always on, default: 0)")
+    p_train.add_argument("--interleave", type=int, default=0,
+                         help="Switch between programs every N steps (0 = sequential, default: 0)")
 
     # --- eval ---
     p_eval = sub.add_parser("eval", help="Interactive evaluation")

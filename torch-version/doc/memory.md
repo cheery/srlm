@@ -80,6 +80,13 @@ individual steps (751-814 range). The model memorized specific Kalevala
 segments through flashcard replay and has sharp "know this" vs "don't know
 this" responses. This smooths out as standalone training continues.
 
+### Memoryless training after scaffold reaches ~560
+
+After the memory-pretrained model was trained without memories, it reached
+560 — matching the original log1 baseline. The model produced recognizable
+Finnish-like text with Kalevala cadence from just 500KB of training data.
+As a diffusion model, generation is parallel and very fast.
+
 ## Alternating study/practice
 
 The `--memory-alternate N` flag switches between phases every N steps:
@@ -101,6 +108,55 @@ study, then test yourself, then study again. Each cycle:
     --memory-refresh N     Re-encode bank every N steps (default: 100)
     --memory-alternate N   Switch study/practice every N steps (0 = always study)
 
+## Multi-task interleaving
+
+The `--interleave N` flag switches between training programs every N steps
+(e.g. Kalevala and arithmetic). Without interleaving, sequential training
+causes catastrophic forgetting — the second task overwrites the first
+entirely.
+
+### Catastrophic forgetting (sequential, heron4)
+
+Training arithmetic for 200 steps then Kalevala: both tasks collapse.
+Arithmetic outputs garbage (`1+2=8`), Kalevala just echoes the prompt.
+
+### Interleaving preserves both tasks (heron5)
+
+With `--interleave 50 --memory-size 50 --memory-k 2 --memory-alternate 10`:
+- Kalevala loss settles to ~490-530 during Kalevala phases
+- Arithmetic loss drops to 5-10 during arithmetic study phases
+- Model generates plausible Finnish text AND retains arithmetic exposure
+
+### Cross-task regularization
+
+A surprising finding: arithmetic training appears to **improve** Finnish
+text generation quality. The interleaved model produces better Finnish than
+a Kalevala-only model trained for the same number of steps. Possible reasons:
+
+- **Arithmetic forces precision** — exact token sequences with no room for
+  fuzzy approximation. This sharpens the model's general denoising ability.
+- **Multi-task regularization** — diverse data prevents overfitting to
+  Kalevala's local optima. The model must learn more general representations.
+- **Memory bank mixing** — during study phases, the bank contains both
+  arithmetic and Kalevala batches. The model learns domain-agnostic memory
+  retrieval.
+
+This echoes multi-task training findings in NLP generally — diverse tasks
+improve individual task performance even when the tasks are unrelated.
+
+### Implications for scaling
+
+If arithmetic acts as a regularizer that improves Finnish, adding more
+diverse tasks should compound the effect. This motivates:
+
+1. **More training** — 400 steps per task is tiny; longer runs should
+   let the model fully internalize both tasks
+2. **Reinforcement learning** — once form is learned, GRPO/GSPO can
+   reward correctness (trivial verifier for arithmetic). The RL signal
+   would indirectly sharpen all tasks through shared representations
+3. **Task diversity** — add QA, code, structured data to push the model
+   toward general-purpose representations
+
 ## Open questions
 
 - What is the optimal alternate cycle length?
@@ -109,3 +165,6 @@ study, then test yourself, then study again. Each cycle:
 - Can memory-trained models reach lower final loss than pure training,
   or just get there faster?
 - Should the memory bank persist across training runs (checkpoint it)?
+- How many diverse tasks can a 10M param model juggle before capacity
+  limits dominate?
+- Does the cross-task improvement scale with model size?
