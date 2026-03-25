@@ -64,6 +64,8 @@ def as_text(p: torch.Tensor) -> str:
 
 def from_text(text: str) -> torch.Tensor:
     data = text.encode("utf-8")
+    if len(data) == 0:
+        return None
     return torch.frombuffer(bytearray(data), dtype=torch.uint8).to(torch.int32)
 
 def param_count(model: nn.Module) -> int:
@@ -552,9 +554,10 @@ def cmd_eval(args):
     while True:
         query = from_text(input("> "))
         def projector(x, q=query):
+            if q is None:
+                return x
             q = q.to(x.device)
-            if len(q) > 0:
-                x[:, :len(q)] = q
+            x[:, :len(q)] = q
             return x
         z = make_z(1, seq_len, config.d_model, device=device)
         z, outputs = sampler.sample(
