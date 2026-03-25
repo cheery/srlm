@@ -240,11 +240,16 @@ class ArithmeticProgram:
         for i in range(self.batch_size):
             n = torch.randint(0, self.max_operand + 1, ()).item()
             m = torch.randint(0, self.max_operand + 1, ()).item()
-            problem = f"{n}+{m}={n+m}"
-            tokens  = torch.frombuffer(bytearray(problem.encode()), dtype=torch.uint8).to(torch.int32)
-            L = min(len(tokens), self.seq_len)
-            batch_clean[i, :L]     = tokens[:L]
-            batch_perturbed[i, :L] = tokens[:L]
+            prompt = f"{n}+{m}="
+            answer = f"{n+m}"
+            full   = prompt + answer
+            full_tokens   = torch.frombuffer(bytearray(full.encode()), dtype=torch.uint8).to(torch.int32)
+            prompt_tokens = torch.frombuffer(bytearray(prompt.encode()), dtype=torch.uint8).to(torch.int32)
+            L = min(len(full_tokens), self.seq_len)
+            batch_clean[i, :L] = full_tokens[:L]
+            # Only show the prompt; mask the answer and rest
+            P = min(len(prompt_tokens), self.seq_len)
+            batch_perturbed[i, :P] = prompt_tokens[:P]
 
         self.step_count += 1
         return batch_clean, batch_perturbed
@@ -253,6 +258,67 @@ class ArithmeticProgram:
         if self.max_steps is None:
             return f"arithmetic(indefinite, done={self.step_count})"
         return f"arithmetic({self.max_steps}, done={self.step_count})"
+
+
+class SudokuProgram:
+    """Trains on sudoku puzzles. Puzzle clues shown unmasked; blanks masked.
+
+    Format: 9 rows of 9 digits separated by newlines (90 bytes with newlines).
+    Zeros in puzzle become MASK_TOKEN; solution provides the clean target.
+    """
+
+    def __init__(self, seq_len, batch_size, max_steps=None,
+                 parquet_path="../../data/valid_0.parquet"):
+        import pandas as pd
+        self.seq_len = seq_len
+        self.batch_size = batch_size
+        self.max_steps = max_steps
+        self.step_count = 0
+        df = pd.read_parquet(parquet_path)
+        self.puzzles = df["puzzle"].values
+        self.solutions = df["solution"].values
+        print(f"Sudoku: {len(self.puzzles)} puzzles loaded")
+
+    def _format_grid(self, digits_81):
+        """Turn '281953647...' into '281953647\\n476218593\\n...' (89 bytes)."""
+        rows = [digits_81[i:i+9] for i in range(0, 81, 9)]
+        return "\n".join(rows)
+
+    def done(self):
+        if self.max_steps is None:
+            return False
+        return self.step_count >= self.max_steps
+
+    def next_batch(self):
+        if self.done():
+            return None
+
+        batch_clean     = torch.full((self.batch_size, self.seq_len), ord(' '), dtype=torch.int32)
+        batch_perturbed = torch.full((self.batch_size, self.seq_len), MASK_TOKEN, dtype=torch.int32)
+
+        for i in range(self.batch_size):
+            idx = torch.randint(0, len(self.puzzles), ()).item()
+            puzzle_grid   = self._format_grid(self.puzzles[idx])
+            solution_grid = self._format_grid(self.solutions[idx])
+
+            sol_tokens = torch.frombuffer(bytearray(solution_grid.encode()), dtype=torch.uint8).to(torch.int32)
+            puz_tokens = torch.frombuffer(bytearray(puzzle_grid.encode()), dtype=torch.uint8).to(torch.int32)
+
+            L = min(len(sol_tokens), self.seq_len)
+            batch_clean[i, :L] = sol_tokens[:L]
+            # Copy solution as base, then mask where puzzle has '0'
+            batch_perturbed[i, :L] = sol_tokens[:L]
+            for j in range(L):
+                if puz_tokens[j] == ord('0'):
+                    batch_perturbed[i, j] = MASK_TOKEN
+
+        self.step_count += 1
+        return batch_clean, batch_perturbed
+
+    def description(self):
+        if self.max_steps is None:
+            return f"sudoku(indefinite, done={self.step_count})"
+        return f"sudoku({self.max_steps}, done={self.step_count})"
 
 
 class QAProgram:
@@ -408,6 +474,9 @@ def cmd_train(args):
     if args.arithmetic is not None:
         max_steps = None if args.arithmetic == 0 else args.arithmetic
         programs.append(ArithmeticProgram(seq_len, batch_size, max_steps))
+    if args.sudoku is not None:
+        max_steps = None if args.sudoku == 0 else args.sudoku
+        programs.append(SudokuProgram(seq_len, batch_size, max_steps))
     if args.qa is not None:
         max_steps = None if args.qa == 0 else args.qa
         programs.append(QAProgram(args.qa_file, seq_len, batch_size, max_steps))
@@ -663,6 +732,8 @@ def main():
                          help="Enable Wikipedia training (0 or omit count = one epoch)")
     p_train.add_argument("--arithmetic", type=int, nargs="?", const=0, default=None,
                          help="Enable arithmetic N+M=Y training (0 or omit count = indefinite)")
+    p_train.add_argument("--sudoku", type=int, nargs="?", const=0, default=None,
+                         help="Enable sudoku training (0 or omit count = indefinite)")
     p_train.add_argument("--qa", type=int, nargs="?", const=0, default=None,
                          help="Enable QA training (0 or omit count = indefinite)")
     p_train.add_argument("--qa-file", type=str, default="../../data/finnish_qa_663.jsonl",
