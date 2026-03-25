@@ -48,6 +48,15 @@ DEFAULT_CONFIG = SRLMConfig(
 MEDIUM_CONFIG = SRLMConfig(
     vocab_size     = TOTAL_VOCAB,
     context_length = 256,
+    d_model        = 384,
+    n_priors       = 4,
+    n_posteriors   = 3,
+    n_heads        = 12,
+)
+
+LARGE_CONFIG = SRLMConfig(
+    vocab_size     = TOTAL_VOCAB,
+    context_length = 256,
     d_model        = 1152,
     n_priors       = 3,
     n_posteriors   = 2,
@@ -426,7 +435,8 @@ def cmd_train(args):
     ckpt_path = cwd / args.checkpoint
     base = load_config(ckpt_path)
     if base is None:
-        base = MEDIUM_CONFIG if args.medium else DEFAULT_CONFIG
+        base = LARGE_CONFIG if args.large else MEDIUM_CONFIG if args.medium else DEFAULT_CONFIG
+        # large > medium > default
     config = SRLMConfig(
         vocab_size       = base.vocab_size,
         context_length   = args.seq_len or base.context_length,
@@ -693,27 +703,108 @@ def cmd_eval(args):
     model = torch.compile(model)
     model.eval()
 
+    puzzles = None
+    solutions = None
+
     score_fn = make_score_fn(model, device)
 
     while True:
-        query = from_text(input("> "))
-        def projector(x, q=query):
-            if q is None:
+        query_text = input("> ")
+        query = from_text(query_text)
+        if query_text.strip() == "!sudoku":
+            if puzzles is None:
+                import pandas as pd
+                cwd    = Path.cwd()
+                # Load puzzles
+                parquet_path = cwd / "../../data/valid_0.parquet"
+                df = pd.read_parquet(parquet_path)
+                puzzles   = df["puzzle"].values
+                solutions = df["solution"].values
+                print(f"Loaded {len(puzzles)} puzzles")
+            def format_grid(digits_81):
+                rows = [digits_81[i:i+9] for i in range(0, 81, 9)]
+                return "\n".join(rows)
+            def parse_grid(text_89):
+                """Extract 81 digits from grid text (9 rows + 8 newlines)."""
+                return text_89.replace("\n", "")
+            idx = torch.randint(0, len(puzzles), ()).item()
+
+            puzzle = puzzles[idx]
+            solution = solutions[idx]
+            missing = puzzle.count('0')
+
+            puzzle_grid   = format_grid(puzzle)
+            solution_grid = format_grid(solution)
+
+            print(f"\nPuzzle #{idx} ({missing} blanks):")
+            print(puzzle_grid.replace('0', '.'))
+            print()
+
+            # Build projector: clue positions stay fixed, zeros become mask
+            sol_tokens = torch.frombuffer(bytearray(solution_grid.encode()), dtype=torch.uint8).to(torch.int32)
+            puz_tokens = torch.frombuffer(bytearray(puzzle_grid.encode()), dtype=torch.uint8).to(torch.int32)
+
+            # Positions where puzzle has a nonzero digit (clues + newlines)
+            clue_mask = (puz_tokens != ord('0'))
+            clue_values = sol_tokens.clone()
+
+            def projector(x, clue_mask=clue_mask, clue_values=clue_values):
+                cm = clue_mask.to(x.device)
+                cv = clue_values.to(x.device)
+                L = min(len(cm), x.shape[1])
+                x[:, :L] = torch.where(cm[:L], cv[:L], x[:, :L])
                 return x
-            q = q.to(x.device)
-            x[:, :len(q)] = q
-            return x
-        z = make_z(1, seq_len, config.d_model, device=device)
-        z, outputs = sampler.sample(
-            score_fn, z, graph, noise,
-            tokenizer=as_text,
-            batch_size=1,
-            batch_len=seq_len,
-            steps=steps,
-            projector=projector,
-            device=device,
-        )
-        print(repr(outputs))
+
+            z = make_z(1, seq_len, config.d_model, device=device)
+            z, outputs = sampler.sample(
+                score_fn, z, graph, noise,
+                tokenizer=as_text,
+                batch_size=1,
+                batch_len=seq_len,
+                steps=steps,
+                projector=projector,
+                device=device,
+            )
+
+            result_text = outputs[0][:89]  # first 89 chars = grid
+            result_digits = parse_grid(result_text)
+
+            # Score it
+            correct = 0
+            total_blanks = 0
+            for p_ch, s_ch, r_ch in zip(puzzle, solution, result_digits):
+                if p_ch == '0':
+                    total_blanks += 1
+                    if r_ch == s_ch:
+                        correct += 1
+
+            print(f"Model output:")
+            print(result_text)
+            print(f"\nScore: {correct}/{total_blanks} blanks correct ({100*correct/max(total_blanks,1):.0f}%)")
+
+            if correct < total_blanks:
+                print(f"\nSolution:")
+                print(solution_grid)
+            print()
+        else:
+            def projector(x, q=query):
+                if q is None:
+                    return x
+                q = q.to(x.device)
+                x[:, :len(q)] = q
+                return x
+            z = make_z(1, seq_len, config.d_model, device=device)
+            z, outputs = sampler.sample(
+                score_fn, z, graph, noise,
+                tokenizer=as_text,
+                batch_size=1,
+                batch_len=seq_len,
+                steps=steps,
+                projector=projector,
+                device=device,
+            )
+            for out in outputs:
+                print(out)
 
 # ---------------------------------------------------------------------------
 # Argparse
@@ -740,7 +831,9 @@ def main():
                          help="Path to JSONL file with question/answer fields")
     # Model config presets and overrides
     p_train.add_argument("--medium", action="store_true",
-                         help="Use medium config (~200M params, dropout=0.2)")
+                         help="Use medium config (~30M params, d_model=384)")
+    p_train.add_argument("--large", action="store_true",
+                         help="Use large config (~200M params, d_model=1152)")
     p_train.add_argument("--d-model", type=int, default=None, dest="d_model",
                          help="Override d_model")
     p_train.add_argument("--n-priors", type=int, default=None, dest="n_priors",
