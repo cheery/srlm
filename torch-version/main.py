@@ -524,8 +524,12 @@ def cmd_train(args):
         print("No training programs specified. Use --kalevala and/or --wikipedia.")
         sys.exit(1)
 
-    # Training log
+    # Training log — preserve history from previous runs
     training_log_lines = []
+    prev_log = ckpt_path / "training.txt"
+    if prev_log.exists():
+        training_log_lines.append(prev_log.read_text().rstrip())
+        training_log_lines.append("")  # blank line separator
     start_time = datetime.now()
     training_log_lines.append(f"started: {start_time.isoformat()}")
     for p in programs:
@@ -533,7 +537,7 @@ def cmd_train(args):
 
     # Create checkpoint dir and loss.txt
     ckpt_path.mkdir(parents=True, exist_ok=True)
-    loss_fd = open(ckpt_path / "loss.txt", "w")
+    loss_fd = open(ckpt_path / "loss.txt", "a")
 
     # Scheduler: linear warmup then cosine decay
     warmup_steps = args.warmup_steps
