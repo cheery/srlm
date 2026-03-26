@@ -20,8 +20,8 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch._inductor.config as inductor_config
-inductor_config.reorder_for_locality = False
+#import torch._inductor.config as inductor_config
+#inductor_config.reorder_for_locality = False
 
 from model import SRLM, SRLMConfig, make_z, AbsorbingGraph, LogLinearNoise, Sampler, loss_function, MemoryBank
 from wiki_data import WikiDataLoader
@@ -468,7 +468,13 @@ def cmd_train(args):
     load_checkpoint(model, ckpt_path)
     no_compile = getattr(args, 'no_compile', False)
     if not no_compile:
-        model = torch.compile(model, backend="aot_eager")
+        # Compile stable submodules individually — the top-level forward
+        # has variable graph shape when memories change the block count.
+        for layer in model.prior:
+            layer.compile()
+        model.main.compile()
+        for layer in model.posterior:
+            layer.compile()
     print(f"Parameters:       {param_count(model):,}")
     print(f"Parameter memory: {param_memory_mb(model):.1f} MB")
 
@@ -706,7 +712,11 @@ def cmd_eval(args):
         sys.exit(1)
     no_compile = getattr(args, 'no_compile', False)
     if not no_compile:
-        model = torch.compile(model, backend="aot_eager")
+        for layer in model.prior:
+            layer.compile()
+        model.main.compile()
+        for layer in model.posterior:
+            layer.compile()
     model.eval()
 
     puzzles = None
