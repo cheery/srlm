@@ -653,9 +653,10 @@ def cmd_train(args):
                 else:
                     grpo_prompt = batch.to(device)
                     # For arithmetic without explicit perturbed_batch,
-                    # re-fetch a batch to get proper prompts
+                    # re-fetch a batch to get proper prompts (don't count as a step)
                     result = program.next_batch()
                     if result is not None:
+                        program.step_count -= 1  # don't double-count
                         batch, perturbed_batch = result
                         grpo_prompt = perturbed_batch.to(device) if perturbed_batch is not None else batch.to(device)
                         batch = batch  # clean target
