@@ -1,15 +1,16 @@
 """
-GRPO (Group Relative Policy Optimization) for discrete diffusion.
+DGPO-style GRPO for discrete diffusion (SEDD).
 
-Adapted from GRPO-Zero for SRLM/SEDD:
-- Generate K candidate completions via diffusion sampling
-- Score each with a verifier (reward function)
-- Compute group-relative advantages
-- Backprop SEDD loss weighted by advantage
+Based on "Reinforcing Diffusion Models by Direct Group Preference Optimization"
+(Luo et al., 2025), adapted for absorbing-state discrete diffusion.
 
-The key insight: instead of autoregressive log_prob * advantage,
-we use sedd_score_entropy * advantage. Good samples get upweighted
-in the denoising objective.
+Flow:
+1. Generate K candidates per prompt via reverse diffusion
+2. Score each with reward_fn
+3. Compute group-relative z-score advantages
+4. DGPO loss: sigmoid-weighted advantage * score_entropy
+   - Reference model = frozen weights before optimization
+   - Sigmoid weight adapts based on model drift from reference
 """
 
 import torch
@@ -118,7 +119,7 @@ def sudoku_reward(generated_tokens, puzzle_tokens=None):
 
 
 # ---------------------------------------------------------------------------
-# GRPO step for diffusion
+# DGPO-style GRPO step
 # ---------------------------------------------------------------------------
 
 def grpo_step(
@@ -139,52 +140,38 @@ def grpo_step(
     sampling_steps=50,   # diffusion steps for generation
     grad_clip=1.0,
     epochs=5,
+    beta_dgpo=1.0,       # DGPO sigmoid temperature
+    fused=False,          # fused backward: faster but more VRAM
 ):
-    """One GRPO update step.
+    """DGPO-style GRPO update for discrete diffusion.
 
-    1. Generate K candidates per prompt via diffusion
+    1. Generate K candidates per prompt via reverse diffusion
     2. Score each with reward_fn
-    3. Compute group-relative advantages
-    4. Weighted SEDD loss update
+    3. Compute group-relative z-score advantages
+    4. Cache reference score_entropy (model before optimization)
+    5. Optimize with DGPO loss: σ(group_drift) * advantage * score_entropy
 
-    Args:
-        model: SRLM model
-        optimizer: optimizer
-        loss_fn: SEDD loss function (from loss_function())
-        sampler: Sampler instance
-        graph: AbsorbingGraph
-        noise: LogLinearNoise
-        prompt_batch: (B, L) — prompts (visible tokens + MASK_TOKEN for blanks)
-        clean_batch:  (B, L) — full ground truth
-        reward_fn: callable(1-D tokens) -> float reward
-        z: HRM state tuple
-        device: torch device
-        K: number of candidates per prompt
-        sampling_steps: diffusion sampling steps
-        grad_clip: gradient clipping norm
-    Returns:
-        loss_value: float
-        z: updated HRM state
-        metrics: dict with reward stats
+    The sigmoid weighting from DGPO prevents the model from drifting too
+    far from the reference in a single step — it's an implicit KL constraint.
     """
     B, L = prompt_batch.shape
     d_model = z[0].shape[-1]
-    MASK_TOKEN = graph.dim - 1  # absorbing state = last index = 256
+    MASK_TOKEN = graph.dim - 1
+
+    prompt_batch = prompt_batch.to(device)
+    clean_batch = clean_batch.to(device)
+    visible = (prompt_batch != MASK_TOKEN)
 
     model.eval()
 
     # --- 1. Generate K candidates per prompt via diffusion ---
-    # Expand prompts: (B,L) -> (B*K, L)
-    prompt_expanded = prompt_batch.repeat_interleave(K, dim=0).to(device)
-
-    # Build projector that fixes visible (non-mask) positions
+    prompt_expanded = prompt_batch.repeat_interleave(K, dim=0)
     visible_mask = (prompt_expanded != MASK_TOKEN)
     visible_values = prompt_expanded.clone()
 
     def projector(x):
         return torch.where(visible_mask, visible_values, x)
 
-    # Expand memories to match B*K batch size for generation
     memories_expanded = None
     if memories is not None:
         memories_expanded = [m.repeat_interleave(K, dim=0) for m in memories]
@@ -212,14 +199,14 @@ def grpo_step(
         z_gen, log_score, _ = model(z_gen, x, sigma)
         score = log_score.exp()
         stag_score = graph.staggered_score(score, sigma)
-        probs = stag_score * graph.transp_transition(x, sigma)
+        probs = stag_score * graph.transp_transition(x.long(), sigma)
         probs = probs[..., :-1]
         x = sample_categorical(probs)
 
-    x = projector(x)  # ensure visible positions are correct
+    x = projector(x)
     generated = x  # (B*K, L)
 
-    # --- 2. Score candidates ---
+    # --- 2. Score candidates with reward_fn ---
     rewards = torch.zeros(B * K, device=device)
     for i in range(B * K):
         rewards[i] = reward_fn(generated[i])
@@ -228,7 +215,7 @@ def grpo_step(
         def _tok2str(t):
             return bytes(t.clamp(0, 255).cpu().tolist()).decode("utf-8", errors="replace").rstrip()
         print("    GRPO candidates:")
-        for b in range(min(B, 4)):  # show up to 4 prompts
+        for b in range(min(B, 4)):
             prompt_str = _tok2str(prompt_batch[b])
             clean_str = _tok2str(clean_batch[b])
             print(f"      prompt: {repr(prompt_str):30s}  target: {repr(clean_str)}")
@@ -246,48 +233,112 @@ def grpo_step(
     advantages = (rewards_grouped - mean_r) / (std_r + 1e-4)
     advantages = advantages.view(B * K)
 
-    # --- 4. Advantage-weighted SEDD loss on generated candidates ---
-    model.train()
+    # --- 4. Pre-cache reference losses and perturbations ---
+    # Before any optimization, compute score_entropy for the current model
+    # at pre-sampled noise levels. These serve as the DGPO reference.
+    sampling_eps = 1e-3
+    ref_cache = []  # [epoch][k] = {sigma, dsigma, perturbed, candidate, ref_loss}
 
-    # Process all K candidates, accumulate gradients
+    with torch.no_grad():
+        for ep in range(epochs):
+            ep_data = []
+            for k in range(K):
+                idx = torch.arange(B, device=device) * K + k
+                candidate_k = generated[idx.cpu()].to(device)
+
+                t = ((1 - sampling_eps) * torch.rand(B, device=device) + sampling_eps)
+                sigma, dsigma = noise(t)
+                perturbed = graph.sample_transition(candidate_k, sigma[:, None])
+                perturbed = torch.where(visible, prompt_batch, perturbed)
+
+                z_k = tuple(zi[:B].detach() for zi in z) if z[0].shape[0] >= B else z
+                z_k, log_score, _ = model(z_k, perturbed, sigma, memories=memories)
+                ref_loss_pp = graph.score_entropy(log_score, sigma[:, None], perturbed, candidate_k)
+                ref_loss_ps = (dsigma[:, None] * ref_loss_pp).sum(dim=-1)  # (B,)
+
+                ep_data.append({
+                    'sigma': sigma,
+                    'dsigma': dsigma,
+                    'perturbed': perturbed.clone(),
+                    'candidate': candidate_k,
+                    'ref_loss': ref_loss_ps,
+                })
+            ref_cache.append(ep_data)
+
+    # --- 5. DGPO optimization ---
+    model.train()
     total_loss = 0.0
-    for _ in range(epochs):
+
+    for ep in range(epochs):
         optimizer.zero_grad()
         n_tokens = 0
-        for k in range(K):
-            idx = torch.arange(B, device=device) * K + k
-            candidate_k = generated[idx.cpu()].to(device)   # (B, L)
-            advantage_k = advantages[idx]                    # (B,)
 
-            # SEDD loss on this candidate
-            sampling_eps = 1e-3
-            t = ((1 - sampling_eps) * torch.rand(B, device=device) + sampling_eps)
-            sigma, dsigma = noise(t)
-            perturbed = graph.sample_transition(candidate_k, sigma[:, None])
+        if fused:
+            # Fused mode: single backward over all K (faster, more VRAM)
+            losses_k = []
+            aux_total = torch.tensor(0.0, device=device)
+            for k in range(K):
+                c = ref_cache[ep][k]
+                z_k = tuple(zi[:B].detach() for zi in z) if z[0].shape[0] >= B else z
+                z_k, log_score, aux_loss = model(z_k, c['perturbed'], c['sigma'], memories=memories)
+                loss_pp = graph.score_entropy(log_score, c['sigma'][:, None], c['perturbed'], c['candidate'])
+                loss_ps = (c['dsigma'][:, None] * loss_pp).sum(dim=-1)
+                losses_k.append(loss_ps)
+                aux_total = aux_total + aux_loss
 
-            # Keep visible positions from prompt
-            vis = (prompt_batch.to(device) != MASK_TOKEN)
-            perturbed = torch.where(vis, candidate_k, perturbed)
+            group_terms = torch.zeros(B, device=device)
+            for k in range(K):
+                idx = torch.arange(B, device=device) * K + k
+                delta = losses_k[k].detach() - ref_cache[ep][k]['ref_loss']
+                group_terms += advantages[idx] * beta_dgpo * delta / K
+            group_weights = torch.sigmoid(group_terms)
 
-            z_k = tuple(zi[:B].detach() for zi in z) if z[0].shape[0] >= B else z
-            z_k, log_score, aux_loss = model(z_k, perturbed, sigma, memories=memories)
-            loss_per_pos = graph.score_entropy(log_score, sigma[:, None], perturbed, candidate_k)
-            loss_per_sample = (dsigma[:, None] * loss_per_pos).sum(dim=-1)  # (B,)
+            weighted_sum = torch.tensor(0.0, device=device)
+            for k in range(K):
+                idx = torch.arange(B, device=device) * K + k
+                weighted_sum = weighted_sum + (group_weights.detach() * advantages[idx] * losses_k[k]).sum()
+                n_masked = (~visible).sum().item()
+                n_tokens += max(n_masked, 1)
 
-            # score_entropy * advantage (no negation — score_entropy is positive,
-            # unlike autoregressive log_prob which is negative)
-            # Positive advantage → minimize score_entropy (reinforce this candidate)
-            # Negative advantage → maximize score_entropy (push away from bad candidate)
-            weighted_loss = (loss_per_sample * advantage_k).sum()
-            # Normalize by total tokens across all K candidates
-            n_masked = (~vis).sum().item()
-            n_tokens += max(n_masked, 1)
+            (weighted_sum + aux_total).backward()
+            total_loss += weighted_sum.item()
 
-            # aux_loss minimized unconditionally (not weighted by advantage)
-            (weighted_loss + aux_loss).backward()
-            total_loss += weighted_loss.item()
+        else:
+            # Sequential mode: per-k backward (less VRAM, extra no-grad pass)
+            cur_losses_detached = []
+            with torch.no_grad():
+                for k in range(K):
+                    c = ref_cache[ep][k]
+                    z_k = tuple(zi[:B].detach() for zi in z) if z[0].shape[0] >= B else z
+                    z_k, log_score, _ = model(z_k, c['perturbed'], c['sigma'], memories=memories)
+                    loss_pp = graph.score_entropy(log_score, c['sigma'][:, None], c['perturbed'], c['candidate'])
+                    loss_ps = (c['dsigma'][:, None] * loss_pp).sum(dim=-1)
+                    cur_losses_detached.append(loss_ps)
 
-        # Normalize accumulated gradients by total token count
+            group_terms = torch.zeros(B, device=device)
+            for k in range(K):
+                idx = torch.arange(B, device=device) * K + k
+                delta = cur_losses_detached[k] - ref_cache[ep][k]['ref_loss']
+                group_terms += advantages[idx] * beta_dgpo * delta / K
+            group_weights = torch.sigmoid(group_terms)
+
+            for k in range(K):
+                c = ref_cache[ep][k]
+                idx = torch.arange(B, device=device) * K + k
+                adv_k = advantages[idx]
+
+                z_k = tuple(zi[:B].detach() for zi in z) if z[0].shape[0] >= B else z
+                z_k, log_score, aux_loss = model(z_k, c['perturbed'], c['sigma'], memories=memories)
+                loss_pp = graph.score_entropy(log_score, c['sigma'][:, None], c['perturbed'], c['candidate'])
+                loss_ps = (c['dsigma'][:, None] * loss_pp).sum(dim=-1)
+
+                weighted_loss = (group_weights.detach() * adv_k * loss_ps).sum()
+                n_masked = (~visible).sum().item()
+                n_tokens += max(n_masked, 1)
+
+                (weighted_loss + aux_loss).backward()
+                total_loss += weighted_loss.item()
+
         if n_tokens > 0:
             for p in model.parameters():
                 if p.grad is not None:
@@ -295,8 +346,6 @@ def grpo_step(
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
-
-        # Update z from the last forward pass
         z_out = tuple(zi.detach() for zi in z_k)
 
     metrics = {

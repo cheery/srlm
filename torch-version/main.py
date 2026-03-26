@@ -681,6 +681,8 @@ def cmd_train(args):
                     sampling_steps=args.grpo_steps,
                     epochs=args.grpo_epochs,
                     verbose=args.print_grpo,
+                    beta_dgpo=args.grpo_beta,
+                    fused=args.grpo_fused,
                 )
                 avg_session = grpo_loss
                 last_grpo_info = (f" | GRPO({grpo_task}) r={grpo_metrics['mean_reward']:.2f}"
@@ -1036,6 +1038,10 @@ def main():
                          help="LoRA rank for GRPO (0 = disabled, trains all params)")
     p_train.add_argument("--lora-alpha", type=float, default=16.0, dest="lora_alpha",
                          help="LoRA scaling alpha (default: 16)")
+    p_train.add_argument("--grpo-beta", type=float, default=1.0, dest="grpo_beta",
+                         help="DGPO sigmoid temperature (default: 1.0)")
+    p_train.add_argument("--grpo-fused", action="store_true", dest="grpo_fused",
+                         help="Fused GRPO backward (faster, uses more VRAM)")
     p_train.add_argument("--print-grpo", action="store_true", dest="print_grpo",
                          help="Print GRPO prompts, candidates, and rewards")
 
