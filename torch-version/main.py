@@ -768,16 +768,70 @@ def cmd_eval(args):
     puzzles = None
     solutions = None
 
-    score_fn = make_score_fn(model, device)
+    # Memory bank for eval
+    memory_bank = None
+    memories = None
+    if args.memory_size > 0:
+        memory_bank = MemoryBank()
+        print(f"Memory bank enabled: size={args.memory_size}, k={args.memory_k}")
+
+    score_fn = make_score_fn(model, device, memories=memories)
+
+    # Persistent z state across queries
+    z = make_z(1, seq_len, config.d_model, device=device)
 
     while True:
         query_text = input("> ")
         query = from_text(query_text)
+
+        # Commands
+        if query_text.strip() == "!reset":
+            z = make_z(1, seq_len, config.d_model, device=device)
+            print("z reset.")
+            continue
+
+        if query_text.strip() == "!remember" and memory_bank is not None:
+            # Encode the last generation into memory
+            if hasattr(cmd_eval, '_last_output'):
+                tokens = from_text(cmd_eval._last_output)
+                if tokens is not None:
+                    batch = tokens.unsqueeze(0).to(device)
+                    memory_bank.encode(model, [batch], device)
+                    while len(memory_bank) > args.memory_size:
+                        memory_bank.tokens.pop(0)
+                        memory_bank.memories.pop(0)
+                        memory_bank.summaries.pop(0)
+                    print(f"Remembered. Bank: {len(memory_bank)} entries.")
+            continue
+
+        if query_text.strip().startswith("!feed ") and memory_bank is not None:
+            # Encode arbitrary text into memory
+            text = query_text.strip()[6:]
+            tokens = from_text(text)
+            if tokens is not None:
+                batch = tokens.unsqueeze(0).to(device)
+                memory_bank.encode(model, [batch], device)
+                while len(memory_bank) > args.memory_size:
+                    memory_bank.tokens.pop(0)
+                    memory_bank.memories.pop(0)
+                    memory_bank.summaries.pop(0)
+                print(f"Fed into memory. Bank: {len(memory_bank)} entries.")
+            continue
+
+        # Retrieve memories for this query
+        if memory_bank is not None and len(memory_bank) >= args.memory_k:
+            if query is not None:
+                with torch.no_grad():
+                    q_emb = model.input.input_emb(query.unsqueeze(0).clamp(0, config.vocab_size - 1).to(device))
+                memories = memory_bank.retrieve(q_emb, args.memory_k)
+            score_fn = make_score_fn(model, device, memories=memories)
+        else:
+            score_fn = make_score_fn(model, device)
+
         if query_text.strip() == "!sudoku":
             if puzzles is None:
                 import pandas as pd
                 cwd    = Path.cwd()
-                # Load puzzles
                 parquet_path = cwd / "../../data/valid_0.parquet"
                 df = pd.read_parquet(parquet_path)
                 puzzles   = df["puzzle"].values
@@ -787,7 +841,6 @@ def cmd_eval(args):
                 rows = [digits_81[i:i+9] for i in range(0, 81, 9)]
                 return "\n".join(rows)
             def parse_grid(text_89):
-                """Extract 81 digits from grid text (9 rows + 8 newlines)."""
                 return text_89.replace("\n", "")
             idx = torch.randint(0, len(puzzles), ()).item()
 
@@ -802,11 +855,8 @@ def cmd_eval(args):
             print(puzzle_grid.replace('0', '.'))
             print()
 
-            # Build projector: clue positions stay fixed, zeros become mask
             sol_tokens = torch.frombuffer(bytearray(solution_grid.encode()), dtype=torch.uint8).to(torch.int32)
             puz_tokens = torch.frombuffer(bytearray(puzzle_grid.encode()), dtype=torch.uint8).to(torch.int32)
-
-            # Positions where puzzle has a nonzero digit (clues + newlines)
             clue_mask = (puz_tokens != ord('0'))
             clue_values = sol_tokens.clone()
 
@@ -817,7 +867,6 @@ def cmd_eval(args):
                 x[:, :L] = torch.where(cm[:L], cv[:L], x[:, :L])
                 return x
 
-            z = make_z(1, seq_len, config.d_model, device=device)
             z, outputs = sampler.sample(
                 score_fn, z, graph, noise,
                 tokenizer=as_text,
@@ -828,10 +877,9 @@ def cmd_eval(args):
                 device=device,
             )
 
-            result_text = outputs[0][:89]  # first 89 chars = grid
+            result_text = outputs[0][:89]
             result_digits = parse_grid(result_text)
 
-            # Score it
             correct = 0
             total_blanks = 0
             for p_ch, s_ch, r_ch in zip(puzzle, solution, result_digits):
@@ -848,6 +896,7 @@ def cmd_eval(args):
                 print(f"\nSolution:")
                 print(solution_grid)
             print()
+            cmd_eval._last_output = result_text
         else:
             def projector(x, q=query):
                 if q is None:
@@ -855,7 +904,6 @@ def cmd_eval(args):
                 q = q.to(x.device)
                 x[:, :len(q)] = q
                 return x
-            z = make_z(1, seq_len, config.d_model, device=device)
             z, outputs = sampler.sample(
                 score_fn, z, graph, noise,
                 tokenizer=as_text,
@@ -867,6 +915,7 @@ def cmd_eval(args):
             )
             for out in outputs:
                 print(out)
+            cmd_eval._last_output = outputs[0] if outputs else ""
 
 # ---------------------------------------------------------------------------
 # Argparse
@@ -954,6 +1003,10 @@ def main():
                         help="Sampling steps (default: 10)")
     p_eval.add_argument("--seq-len", type=int, default=None,
                         help="Sequence length (default: from config)")
+    p_eval.add_argument("--memory-size", type=int, default=0,
+                        help="Memory bank capacity (0 = disabled)")
+    p_eval.add_argument("--memory-k", type=int, default=2,
+                        help="Number of memories to retrieve per query")
 
     args = parser.parse_args()
     if args.command == "train":
