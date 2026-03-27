@@ -1040,8 +1040,8 @@ def main():
                          help="Save checkpoint every N global steps (default: 1000)")
     p_train.add_argument("--report-every", type=int, default=10,
                          help="Report loss every N steps (default: 10)")
-    p_train.add_argument("--supervision", type=int, default=20,
-                         help="Supervision steps per training step (default: 20)")
+    p_train.add_argument("--supervision", type=int, default=8,
+                         help="Supervision steps per training step (default: 8)")
     p_train.add_argument("--batch-size", type=int, default=32,
                          help="Batch size (default: 32)")
     p_train.add_argument("--seq-len", type=int, default=None,
@@ -1074,8 +1074,8 @@ def main():
                          help="LoRA scaling alpha (default: 16)")
     p_train.add_argument("--grpo-beta", type=float, default=1.0, dest="grpo_beta",
                          help="DGPO sigmoid temperature (default: 1.0)")
-    p_train.add_argument("--grpo-act-steps", type=int, default=20, dest="grpo_act_steps",
-                         help="Adaptive computation steps per diffusion step in GRPO (default: 20)")
+    p_train.add_argument("--grpo-act-steps", type=int, default=8, dest="grpo_act_steps",
+                         help="Adaptive computation steps per diffusion step in GRPO (default: 8)")
     p_train.add_argument("--grpo-fused", action="store_true", dest="grpo_fused",
                          help="Fused GRPO backward (faster, uses more VRAM)")
     p_train.add_argument("--print-grpo", action="store_true", dest="print_grpo",
@@ -1096,8 +1096,8 @@ def main():
                         help="Number of memories to retrieve per query")
     p_eval.add_argument("--ema", action="store_true",
                         help="Use EMA weights for eval (only useful after long training)")
-    p_eval.add_argument("--act-steps", type=int, default=20,
-                        help="Max adaptive computation steps per diffusion step (default: 20)")
+    p_eval.add_argument("--act-steps", type=int, default=8,
+                        help="Max adaptive computation steps per diffusion step (default: 8)")
 
     args = parser.parse_args()
     if args.tf32:
