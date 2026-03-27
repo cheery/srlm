@@ -410,12 +410,14 @@ def make_score_fn(model, device, d_model, memories=None, max_act_steps=8):
         B, L = x.shape
         z = make_z(B, L, d_model, device=device)
 
-        # Adaptive computation: recurse until Q_head says "good enough"
+        # Adaptive computation: recur() is cheap (HRM + Q_head only),
+        # head() (posterior + output) runs once at the end
         ix = model.front(x, sigma, memories=memories)
         for _ in range(max_act_steps):
-            z, log_score, q, _aux = model.step(z, ix)
+            z, y, q = model.recur(z, ix)
             if (q.squeeze(-1) > 0).all():
                 break
+        log_score, _aux = model.head(y, ix)
         return log_score
     return score_fn
 

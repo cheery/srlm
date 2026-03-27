@@ -187,13 +187,14 @@ def grpo_step(
             t = timesteps[i].expand(B * K)
             x = projector(x)
             sigma, dsigma = noise(t)
-            # Fresh z + adaptive computation via Q_head
+            # Fresh z + adaptive computation: recur() loop + head() once
             z_gen = make_z_for_grpo(B * K, L, d_model, device)
             ix = model.front(x, sigma, memories=memories_expanded)
             for _ in range(max_act_steps):
-                z_gen, log_score, q, _ = model.step(z_gen, ix)
+                z_gen, y, q = model.recur(z_gen, ix)
                 if (q.squeeze(-1) > 0).all():
                     break
+            log_score, _ = model.head(y, ix)
             score = log_score.exp()
             rev_rate = dt * dsigma[..., None, None] * graph.reverse_rate(x, score)
             x = graph.sample_rate(x, rev_rate)
@@ -203,11 +204,12 @@ def grpo_step(
         t = timesteps[-1].expand(B * K)
         sigma = noise(t)[0]
         z_gen = make_z_for_grpo(B * K, L, d_model, device)
-        ix = model.front(x, sigma)
+        ix = model.front(x, sigma, memories=memories_expanded)
         for _ in range(max_act_steps):
-            z_gen, log_score, q, _ = model.step(z_gen, ix, memories=memories_expanded)
+            z_gen, y, q = model.recur(z_gen, ix)
             if (q.squeeze(-1) > 0).all():
                 break
+        log_score, _ = model.head(y, ix)
         score = log_score.exp()
         stag_score = graph.staggered_score(score, sigma)
         probs = stag_score * graph.transp_transition(x.long(), sigma)

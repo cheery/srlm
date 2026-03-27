@@ -157,21 +157,28 @@ class SRLM(nn.Module):
         h = self.block_res(blocks)
         return x, h, blocks, p, t, sigma
 
-    def step(self, st, ix):
-        """Run HRM + posterior layers. ix comes from front().
+    def recur(self, st, ix):
+        """Run just HRM + Q_head. Cheap — call this in adaptive loops.
 
         Returns:
             st: new HRM state (detached)
-            log_score: (B, L, V) output logits
+            y: HRM output (B, L, D)
             q: (B, 1) halting signal
+        """
+        x, h, blocks, p, t, sigma = ix
+        st, y = self.main(st, h, p, t)
+        q = self.Q_head(y.mean(dim=1))
+        return st, y, q
+
+    def head(self, y, ix):
+        """Run posterior layers + output. Expensive — call once after recur() loop.
+
+        Returns:
+            log_score: (B, L, V) output logits
             aux_loss: routing entropy loss
         """
         x, h, blocks, p, t, sigma = ix
-        # Copy blocks so repeated step() calls don't accumulate
         blocks = list(blocks)
-
-        st, y = self.main(st, h, p, t)
-        q = self.Q_head(y.mean(dim=1))  # (B, 1) — adaptive halting signal
         blocks.append(y)
 
         aux_routing_losses = []
@@ -188,13 +195,25 @@ class SRLM(nn.Module):
         aux_loss = torch.tensor(0.0, device=x.device)
         if self.training and aux_routing_losses:
             for rw in aux_routing_losses:
-                # Entropy of routing weights — maximize it to prevent collapse
                 entropy = -(rw * (rw + 1e-8).log()).sum()
                 max_entropy = math.log(len(rw))
                 aux_loss = aux_loss + (max_entropy - entropy)
             aux_loss = aux_loss / len(aux_routing_losses) * self.cfg.aux_routing_weight
 
-        return st, self.output(x, y, sigma), q, aux_loss
+        return self.output(x, y, sigma), aux_loss
+
+    def step(self, st, ix):
+        """Convenience: recur() + head() in one call.
+
+        Returns:
+            st: new HRM state (detached)
+            log_score: (B, L, V) output logits
+            q: (B, 1) halting signal
+            aux_loss: routing entropy loss
+        """
+        st, y, q = self.recur(st, ix)
+        log_score, aux_loss = self.head(y, ix)
+        return st, log_score, q, aux_loss
 
     def forward(self, z, x, sigma, memories=None):
         """Standard API: front() + step() in one call.
