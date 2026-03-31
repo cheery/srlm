@@ -20,10 +20,12 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.profiler import profile, ProfilerActivity, record_function
 #import torch._inductor.config as inductor_config
 #inductor_config.reorder_for_locality = False
 
-from model import SRLM, SRLMConfig, make_z, AbsorbingGraph, LogLinearNoise, Sampler, loss_function, deep_supervision_step, MemoryBank, EMA
+from model import SRLM, SRLMConfig, make_z, deep_supervision_step, MemoryBank, EMA
+from model.sedd import Sampler, LogLinearSchedule, sample, sample_conditional, score_entropy_loss
 from model.grpo import grpo_step, arithmetic_reward, sudoku_reward
 from model.lora import apply_lora, lora_parameters, merge_lora, unmerge_lora
 from wiki_data import WikiDataLoader
@@ -42,11 +44,11 @@ PARQUET_FILES = [
 
 DEFAULT_CONFIG = SRLMConfig(
     vocab_size     = TOTAL_VOCAB,
-    context_length = 256,
+    context_length = 128,
     d_model        = 256,
     n_priors       = 3,
     n_posteriors   = 2,
-    n_heads        = 8,
+    n_heads        = 4,
 )
 
 MEDIUM_CONFIG = SRLMConfig(
@@ -140,7 +142,10 @@ def load_config(ckpt_dir: Path) -> SRLMConfig | None:
     cfg_path = ckpt_dir / "config.json"
     if cfg_path.exists():
         with open(cfg_path) as f:
-            return SRLMConfig(**json.load(f))
+            d = json.load(f)
+        # Handle non-primitive fields
+        d.pop("outlet", None)
+        return SRLMConfig(**d)
     return None
 
 # ---------------------------------------------------------------------------
@@ -421,22 +426,6 @@ def make_score_fn(model, device, d_model, memories=None, max_act_steps=8):
         return log_score
     return score_fn
 
-# ---------------------------------------------------------------------------
-# Train step factory
-# ---------------------------------------------------------------------------
-
-def make_train_step(model, optimizer, loss_fn, device):
-    def train_step(z, batch, perturbed_batch=None, memories=None):
-        batch = batch.to(device)
-        if perturbed_batch is not None:
-            perturbed_batch = perturbed_batch.to(device)
-        optimizer.zero_grad()
-        loss, z = loss_fn(z, batch, perturbed_batch=perturbed_batch, memories=memories)
-        loss.backward()
-        nn.utils.clip_grad_norm_(model.parameters(), 0.1)
-        optimizer.step()
-        return loss.item(), z
-    return train_step
 
 # ---------------------------------------------------------------------------
 # Commands
@@ -471,24 +460,30 @@ def cmd_train(args):
     save_every  = args.save_every
     report_every = args.report_every
 
-    # Graph / noise / sampler
-    graph   = AbsorbingGraph(VOCAB_SIZE)
-    noise   = LogLinearNoise()
+    # Noise schedule
+    schedule = LogLinearSchedule()
 
+    from model.srlm import ScoreTransformer
     # Model
     print("Initialising model...")
     model = SRLM(config).to(device)
+    model = ScoreTransformer(257, config.context_length,
+                             dim=256,
+                             num_heads=4,
+                             num_layers=4).to(device)
+    model.cfg = config
+    sampler = Sampler(model, 257)
     # Load existing checkpoint
     load_checkpoint(model, ckpt_path)
     no_compile = getattr(args, 'no_compile', False)
-    if not no_compile:
+    #if not no_compile:
         # Compile stable submodules individually — the top-level forward
         # has variable graph shape when memories change the block count.
-        for layer in model.prior:
-            layer.compile()
-        model.main.compile()
-        for layer in model.posterior:
-            layer.compile()
+    #    for layer in model.prior:
+    #        layer.compile()
+    #    model.main.compile()
+    #    for layer in model.posterior:
+    #        layer.compile()
     print(f"Parameters:       {param_count(model):,}")
     print(f"Parameter memory: {param_memory_mb(model):.1f} MB")
 
@@ -501,9 +496,9 @@ def cmd_train(args):
         n_lora = sum(p.numel() for p in lora_params)
         print(f"LoRA: rank={args.lora_rank}, alpha={args.lora_alpha}, "
               f"{len(lora_layers)} layers, {n_lora:,} trainable params")
-        grpo_optimizer = optim.AdamW(lora_params, lr=args.lr, weight_decay=0.01)
+        grpo_optimizer = optim.AdamW(lora_params, lr=args.lr, weight_decay=0.003)
 
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
+    optimizer = optim.Adam(model.parameters(), lr=args.lr)# weight_decay=0.003)
 
     # Separate GRPO optimizer to prevent Adam momentum corruption
     # GRPO gradients have very different scale/statistics from SEDD gradients;
@@ -518,9 +513,7 @@ def cmd_train(args):
         ema.load_state_dict(torch.load(ema_path, map_location=device, weights_only=True))
         print(f"Loaded EMA from {ema_path}")
 
-    loss_fn   = loss_function(model, graph, noise)
-
-    train_step = make_train_step(model, optimizer, loss_fn, device)
+    # loss_fn and train_step removed — deep_supervision_step handles everything
 
     # Build training programs
     programs = []
@@ -557,7 +550,7 @@ def cmd_train(args):
 
     # Create checkpoint dir and loss.txt
     ckpt_path.mkdir(parents=True, exist_ok=True)
-    loss_fd = open(ckpt_path / "loss.txt", "a")
+    loss_fd = open(ckpt_path / "loss.txt", "w")
 
     # Scheduler: linear warmup then cosine decay
     warmup_steps = args.warmup_steps
@@ -594,6 +587,7 @@ def cmd_train(args):
     running_loss = 0.0
     program_idx = 0
     last_grpo_info = ""
+    ema_loss = None
 
     try:
         while True:
@@ -694,7 +688,7 @@ def cmd_train(args):
                 z = make_z(batch_size, seq_len, config.d_model, device=device)
                 grpo_opt = grpo_optimizer if grpo_optimizer is not None else optimizer
                 grpo_loss, z, grpo_metrics = grpo_step(
-                    model, grpo_opt, loss_fn, Sampler(), graph, noise,
+                    model, grpo_opt, schedule,
                     grpo_prompt, batch.to(device), reward_fn, z, device,
                     memories=memories,
                     K=args.grpo_k,
@@ -714,13 +708,27 @@ def cmd_train(args):
                 z = make_z(batch_size, seq_len, config.d_model, device=device)
                 batch_dev = batch.to(device)
                 pb_dev = perturbed_batch.to(device) if perturbed_batch is not None else None
-                avg_session, z = deep_supervision_step(
-                    model, optimizer, graph, noise, z, batch_dev,
-                    n_supervision=supervision,
-                    perturbed_batch=pb_dev,
-                    memories=memories,
-                    ema=ema,
-                )
+                #print(repr(as_text(batch_dev[0])))
+                model.train()
+                optimizer.zero_grad()
+                loss = score_entropy_loss(model,
+                                          batch_dev,
+                                          257,
+                                          sampler.schedule)
+                #loss = sampler.score_entropy_loss(batch_dev)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+
+                avg_session = loss.item()
+                
+                #avg_session, z = deep_supervision_step(
+                #    model, optimizer, schedule, z, batch_dev,
+                #    n_supervision=supervision,
+                #    perturbed_batch=pb_dev,
+                #    memories=memories,
+                #    ema=ema,
+                #)
             running_loss += avg_session
             global_step += 1
 
@@ -733,13 +741,15 @@ def cmd_train(args):
 
             if global_step % report_every == 0:
                 avg = running_loss / report_every
+                ema_loss = avg if ema_loss is None else 0.99 * ema_loss + 0.01 * avg
+
                 if use_memory:
                     phase = "study" if memory_active else "practice"
                     mem_info = f" | {phase} ({len(memory_bank)})"
                 else:
                     mem_info = ""
                 prog_name = program.description().split("(")[0]
-                print(f"  step {global_step:6d} | loss {avg:.4f} | {prog_name} | lr {scheduler.get_last_lr()[0]:.2e}{mem_info}{last_grpo_info}")
+                print(f"  step {global_step:6d} | loss {avg:.4f} | ema {ema_loss:.4f} | {prog_name} | lr {scheduler.get_last_lr()[0]:.2e}{mem_info}{last_grpo_info}")
                 last_grpo_info = ""
                 running_loss = 0.0
 
@@ -811,9 +821,7 @@ def cmd_eval(args):
     seq_len = args.seq_len or config.context_length
     steps   = args.steps
 
-    graph   = AbsorbingGraph(VOCAB_SIZE)
-    noise   = LogLinearNoise()
-    sampler = Sampler()
+    schedule = LogLinearSchedule()
 
     print("Initialising model...")
     model = SRLM(config).to(device)
@@ -839,6 +847,7 @@ def cmd_eval(args):
         model.main.compile()
         for layer in model.posterior:
             layer.compile()
+        model.output.compile()
     model.eval()
 
     puzzles = None
@@ -940,15 +949,13 @@ def cmd_eval(args):
                 x[:, :L] = torch.where(cm[:L], cv[:L], x[:, :L])
                 return x
 
-            outputs = sampler.sample(
-                score_fn, graph, noise,
-                tokenizer=as_text,
-                batch_size=1,
-                batch_len=seq_len,
-                steps=steps,
-                projector=projector,
+            xt = sample_conditional(
+                score_fn, projector,
+                batch=1, seq_len=seq_len, vocab_size=TOTAL_VOCAB,
+                schedule=schedule, num_steps=steps,
                 device=device,
             )
+            outputs = [as_text(xi) for xi in xt]
 
             result_text = outputs[0][:89]
             result_digits = parse_grid(result_text)
@@ -971,21 +978,24 @@ def cmd_eval(args):
             print()
             cmd_eval._last_output = result_text
         else:
-            def projector(x, q=query):
-                if q is None:
+            if query is not None:
+                def projector(x, q=query):
+                    q_dev = q.to(x.device)
+                    x[:, :len(q_dev)] = q_dev
                     return x
-                q = q.to(x.device)
-                x[:, :len(q)] = q
-                return x
-            outputs = sampler.sample(
-                score_fn, graph, noise,
-                tokenizer=as_text,
-                batch_size=1,
-                batch_len=seq_len,
-                steps=steps,
-                projector=projector,
-                device=device,
-            )
+                xt = sample_conditional(
+                    score_fn, projector,
+                    batch=1, seq_len=seq_len, vocab_size=TOTAL_VOCAB,
+                    schedule=schedule, num_steps=steps,
+                    device=device,
+                )
+            else:
+                xt = sample(
+                    score_fn, batch=1, d=seq_len, n=TOTAL_VOCAB,
+                    schedule=schedule, num_steps=steps,
+                    device=device,
+                )
+            outputs = [as_text(xi) for xi in xt]
             for out in outputs:
                 print(out)
             cmd_eval._last_output = outputs[0] if outputs else ""
@@ -1080,6 +1090,8 @@ def main():
                          help="Fused GRPO backward (faster, uses more VRAM)")
     p_train.add_argument("--print-grpo", action="store_true", dest="print_grpo",
                          help="Print GRPO prompts, candidates, and rewards")
+    p_train.add_argument("--profile", action="store_true", dest="profile",
+                         help="Profile the training loop")
 
     # --- eval ---
     p_eval = sub.add_parser("eval", help="Interactive evaluation")
@@ -1104,7 +1116,13 @@ def main():
         torch.set_float32_matmul_precision('high')
         print("TF32 matmul precision enabled")
     if args.command == "train":
-        cmd_train(args)
+        if args.profile:
+            with profile(activities=[ProfilerActivity.CPU], record_shapes=True) as prof:
+                with record_function("training"):
+                    cmd_train(args)
+            print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=100))
+        else:
+            cmd_train(args)
     elif args.command == "eval":
         cmd_eval(args)
 

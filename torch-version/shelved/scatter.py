@@ -1,4 +1,5 @@
 import torch
+import math
 
 def scatter(
     indices: torch.Tensor,  # (B, L) int
@@ -7,9 +8,11 @@ def scatter(
 ) -> torch.Tensor:
 
     esigm1_log = torch.where(sigma < 0.5, torch.expm1(sigma), sigma.exp() - 1).log().to(x.dtype)[:, None, None]
-    x = x - esigm1_log - torch.log(
-        torch.tensor(x.shape[-1] - 1, dtype=x.dtype, device=x.device)
-    )
+    x = x - esigm1_log - math.log(x.shape[-1] - 1)
+    
+    #x = x - esigm1_log - torch.log(
+    #    torch.tensor(x.shape[-1] - 1, dtype=x.dtype, device=x.device)
+    #)
     x = torch.scatter(x, -1, indices[..., None], torch.zeros_like(x[..., :1]))
 
 #    esigm1 = torch.where(sigma < 0.5, torch.expm1(sigma), sigma.exp() - 1.0)

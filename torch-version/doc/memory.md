@@ -1,5 +1,9 @@
 # Memory System
 
+Note that this information here is not up to date.
+Right now I don't notice any kind of benefit on a memory system,
+but in other hand I'm using a different system now.
+
 ## Overview
 
 The SRLM has an external memory mechanism derived from the MSA paper's

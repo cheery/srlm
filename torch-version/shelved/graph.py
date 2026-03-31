@@ -86,10 +86,12 @@ class AbsorbingGraph(Graph):
                 - F.one_hot(i, self.dim).float())
 
     def transp_rate(self, i: torch.Tensor) -> torch.Tensor:
-        edge = -F.one_hot(i, self.dim).float()
-        is_mask = (i == self.dim - 1)
-        edge[is_mask] = edge[is_mask] + 1.0
-        return edge
+        oh = F.one_hot(i, self.dim).float()
+        is_mask_1 = (i == self.dim - 1).float().unsqueeze(-1)
+        return is_mask_1 - oh
+        #edge = -F.one_hot(i, self.dim).float()
+        #edge[is_mask] = edge[is_mask] + 1.0
+        #return edge
 
     def transition(self, i: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
