@@ -31,8 +31,7 @@ sys.path.insert(0, str((Path(__file__).parent / "../../model").resolve()))
 
 from edlm import (
     DenoisingTransformer, EnergyModel, MDLMLoss, NCELoss,
-    LogLinearSchedule, mask_tokens, sample, Sampler, SamplingStepper,
-    SamplingStep,
+    LogLinearSchedule, mask_tokens, sample, Sampler,
     load_kalevala, create_dataloader, as_text, nce_loss,
     estimate_nll,
 )
@@ -342,9 +341,6 @@ def sample_with_memory(
     batch_size,
     seq_len,
     num_steps=256,
-    energy_model=None,
-    k=8,
-    window_w=0.2,
     device=torch.device("cpu"),
     initial_memory=None,
 ):
@@ -355,14 +351,13 @@ def sample_with_memory(
     to accumulate and refine its understanding as tokens are revealed.
     """
     sampler = Sampler(schedule, mem_denoiser.mask_id, mem_denoiser.n_vocab)
-    xt, stepper = sampler(batch_size, seq_len, device, num_steps,
-                          energy_model=energy_model, k=k, window_w=window_w)
+    xt, stepper = sampler(batch_size, seq_len, device, num_steps)
 
     memory = initial_memory
 
     for s in stepper:
         logits, memory, _ = mem_denoiser(xt, s.t, memory=memory)
-        xt = s.sample(xt, logits)
+        xt = s.reverse_step(xt, s.propose_x0(xt, logits))
 
     return xt, memory
 

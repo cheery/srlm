@@ -222,9 +222,87 @@ class QHead(nn.Module):
 # CMM Model
 # ============================================================
 
+class PonderBlock(nn.Module):
+    """
+    CMM-style recursive reasoning block.
+
+    Runs N_H high-level cycles, each with N_L low-level steps,
+    using a single shared RecursiveBlock (TRM: F_L ≡ F_H).
+
+    Architecture (Eqs 4-5):
+      For N_H high-level cycles:
+        For N_L low-level steps:
+          ẑ_L = F(ẑ_H + ẑ_L + x; θ)     [L-module]
+        ẑ_H = F(ẑ_H + ẑ_L; θ)            [H-module]
+
+    Optional NSDE noise injection for robust latent trajectories.
+    Q-head predicts halt/continue for adaptive computation.
+    """
+    def __init__(self, dim: int, max_context_length: int,
+                 num_heads: int = 4, mlp_ratio: int = 4,
+                 N_H: int = 3, N_L: int = 6,
+                 noise_sigma: float = 0.0,
+                 noise_type: str = "additive",
+                 use_attention: bool = False,
+                 use_stablemax: str = "3"):
+        super().__init__()
+        self.N_H = N_H
+        self.N_L = N_L
+        self.noise_sigma = noise_sigma
+        self.noise_type = noise_type
+
+        self.block = RecursiveBlock(
+            dim, max_context_length, num_heads, mlp_ratio,
+            use_attention, use_stablemax,
+        )
+        self.q_head = QHead(dim, max_context_length)
+
+    def _inject_noise(self, z: torch.Tensor) -> torch.Tensor:
+        """NSDE noise injection (Eqs 42-43)."""
+        if self.noise_sigma <= 0 or not self.training:
+            return z
+        noise = torch.randn_like(z) * self.noise_sigma
+        if self.noise_type == "additive":
+            return z + noise
+        else:
+            return z * (1.0 + noise)
+
+    def forward(self, x: torch.Tensor,
+                z_H: Optional[torch.Tensor] = None,
+                z_L: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            x:   input representation (B, S, D) — drives the L-module
+            z_H: initial high-level state (B, S, D) or None → clone of x
+            z_L: initial low-level state (B, S, D) or None → zeros
+
+        Returns:
+            z_H:      final high-level state (B, S, D)
+            z_L:      final low-level state (B, S, D)
+            q_values: halt/continue Q-values (B, 2)
+        """
+        if z_H is None:
+            z_H = x.clone()
+        if z_L is None:
+            z_L = torch.zeros_like(x)
+
+        for _ in range(self.N_H):
+            for _ in range(self.N_L):
+                z_L = self.block(z_H + z_L + x)
+                z_L = self._inject_noise(z_L)
+            z_H = self.block(z_H + z_L)
+            z_H = self._inject_noise(z_H)
+
+        return z_H, z_L, self.q_head(z_H)
+
+
 class CMM(nn.Module):
     """
     Contraction Mapping Model.
+
+    Wraps PonderBlock with input/output embeddings for end-to-end
+    token prediction.
 
     Args:
         n_vocab: vocabulary size (input and output)
@@ -238,7 +316,6 @@ class CMM(nn.Module):
         use_stablemax: "none", "1", "3", or "5"
         noise_sigma: σ for NSDE noise injection (0 = deterministic ODE)
         noise_type: "additive" or "multiplicative"
-        identical_layers: if True, use weight-sharing within the block too
     """
     def __init__(
         self,
@@ -258,73 +335,21 @@ class CMM(nn.Module):
         self.n_vocab = n_vocab
         self.seq_len = seq_len
         self.dim = dim
-        self.N_H = N_H
-        self.N_L = N_L
-        self.noise_sigma = noise_sigma
-        self.noise_type = noise_type
         self.use_stablemax = use_stablemax
 
-        # Input/output embeddings
         self.input_embed = nn.Embedding(n_vocab, dim)
         self.output_embed = nn.Linear(dim, n_vocab)
 
-        # Single shared recursive block (TRM: F_L ≡ F_H)
-        self.block = RecursiveBlock(
+        self.ponder = PonderBlock(
             dim, seq_len, num_heads, mlp_ratio,
+            N_H, N_L, noise_sigma, noise_type,
             use_attention, use_stablemax,
         )
 
-        # Q-head for ACT
-        self.q_head = QHead(dim, seq_len)
-
-    def _inject_noise(self, z: torch.Tensor) -> torch.Tensor:
-        """NSDE noise injection (Eqs 42-43)."""
-        if self.noise_sigma <= 0 or not self.training:
-            return z
-        noise = torch.randn_like(z) * self.noise_sigma
-        if self.noise_type == "additive":
-            return z + noise  # Eq 42
-        else:
-            return z * (1.0 + noise)  # Eq 43
-
-    def forward_reasoning(
-        self,
-        x_emb: torch.Tensor,
-        z_H: Optional[torch.Tensor] = None,
-        z_L: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Run N_H × N_L recursive reasoning steps (Eqs 4-5).
-
-        Args:
-            x_emb: embedded input x̃ (B, S, D)
-            z_H: initial high-level state (B, S, D) or None → x̃
-            z_L: initial low-level state (B, S, D) or None → zeros
-
-        Returns:
-            z_H: final high-level state
-            z_L: final low-level state
-        """
-        B, S, D = x_emb.shape
-
-        if z_H is None:
-            z_H = x_emb.clone()
-        if z_L is None:
-            z_L = torch.zeros_like(x_emb)
-
-        step = 0
-        for h in range(self.N_H):
-            for l in range(self.N_L):
-                # L-module: ẑ_L = F(ẑ_H + ẑ_L + x̃; θ)  [Eq 4]
-                z_L = self.block(z_H + z_L + x_emb)
-                z_L = self._inject_noise(z_L)
-                step += 1
-
-            # H-module: ẑ_H = F(ẑ_H + ẑ_L; θ)  [Eq 5]
-            z_H = self.block(z_H + z_L)
-            z_H = self._inject_noise(z_H)
-
-        return z_H, z_L
+    @property
+    def block(self):
+        """Access the shared RecursiveBlock (for auxiliary losses)."""
+        return self.ponder.block
 
     def forward(
         self,
@@ -343,13 +368,10 @@ class CMM(nn.Module):
             dict with: logits, z_H, z_L, q_values
         """
         x_emb = self.input_embed(x)
-        z_H, z_L = self.forward_reasoning(x_emb, z_H, z_L)
-
-        logits = self.output_embed(z_H)  # (B, S, n_vocab)
-        q_values = self.q_head(z_H)      # (B, 2)
+        z_H, z_L, q_values = self.ponder(x_emb, z_H, z_L)
 
         return {
-            "logits": logits,
+            "logits": self.output_embed(z_H),
             "z_H": z_H,
             "z_L": z_L,
             "q_values": q_values,
@@ -670,13 +692,13 @@ class CMMTrainer:
         for seg in range(self.N_super):
             x_emb = self.model.input_embed(x)
             # Forward reasoning pass
-            z_H_new, z_L_new = self.model.forward_reasoning(x_emb, z_H, z_L)
+            z_H_new, z_L_new, q_values = self.model.ponder(x_emb, z_H, z_L)
 
             result = {
                 "logits": self.model.output_embed(z_H_new),
                 "z_H": z_H_new,
                 "z_L": z_L_new,
-                "q_values": self.model.q_head(z_H_new),
+                "q_values": q_values,
             }
 
             # Only compute expensive losses (equilibrium, RH) on last segment
@@ -723,32 +745,6 @@ class CMMTrainer:
         # Average over segments actually run
         n_run = seg + 1
         return {k: v / n_run for k, v in all_losses.items()}
-
-
-# ============================================================
-# EMA (Exponential Moving Average)
-# ============================================================
-
-class EMA:
-    """Simple EMA for model weights."""
-    def __init__(self, model: nn.Module, mu: float = 0.999):
-        self.mu = mu
-        self.shadow = {name: p.data.clone()
-                       for name, p in model.named_parameters()}
-
-    def update(self, model: nn.Module):
-        for name, p in model.named_parameters():
-            self.shadow[name].mul_(self.mu).add_(p.data, alpha=1 - self.mu)
-
-    def apply(self, model: nn.Module):
-        self.backup = {name: p.data.clone()
-                       for name, p in model.named_parameters()}
-        for name, p in model.named_parameters():
-            p.data.copy_(self.shadow[name])
-
-    def restore(self, model: nn.Module):
-        for name, p in model.named_parameters():
-            p.data.copy_(self.backup[name])
 
 
 # ============================================================

@@ -1,41 +1,45 @@
 """
-main.py — Training and inference entry point for SRLM in PyTorch.
+main.py — Training and inference for SRLM v2.
+
+SRLM = MDLM denoiser + G-Mem + gated PonderBlock.
 
 Usage:
     python main.py train <checkpoint> [--kalevala STEPS] [--wikipedia STEPS]
-                                      [--save-every N] [--report-every N]
-                                      [--supervision K] [--batch-size B]
-                                      [--seq-len L] [--lr LR]
-    python main.py eval <checkpoint>  [--steps N] [--seq-len L]
+                                      [--sudoku STEPS] [--arithmetic STEPS]
+                                      [--qa STEPS --qa-file PATH]
+                                      [--memory-size N] [--memory-alternate N]
+    python main.py eval <checkpoint>  [--steps N]
 """
 
 import argparse
 import json
 import math
 import sys
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
-from torch.profiler import profile, ProfilerActivity, record_function
-#import torch._inductor.config as inductor_config
-#inductor_config.reorder_for_locality = False
 
-from model import SRLM, SRLMConfig, make_z, deep_supervision_step, MemoryBank, EMA
-from model.sedd import Sampler, LogLinearSchedule, sample, sample_conditional, score_entropy_loss
+from model.model import (
+    SRLMConfig, GMemConfig, PonderConfig,
+    SRLMDenoiser, SRLMEnergyModel,
+    mdlm_loss, nce_loss, sample, ponder_forward, PonderTrainer,
+)
+from model.edlm import LogLinearSchedule, Sampler
+from model.ema import EMA
 from model.grpo import grpo_step, arithmetic_reward, sudoku_reward
-from model.lora import apply_lora, lora_parameters, merge_lora, unmerge_lora
 from wiki_data import WikiDataLoader
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-VOCAB_SIZE  = 256
-TOTAL_VOCAB = 257
+VOCAB_SIZE = 256
+MASK_TOKEN = VOCAB_SIZE  # 256 = absorbing state
 
 PARQUET_FILES = [
     "../../data/train-00000-of-00002.parquet",
@@ -43,32 +47,32 @@ PARQUET_FILES = [
 ]
 
 DEFAULT_CONFIG = SRLMConfig(
-    vocab_size     = TOTAL_VOCAB,
-    context_length = 128,
-    d_model        = 256,
-    n_priors       = 3,
-    n_posteriors   = 2,
-    n_heads        = 4,
+    gmem   = GMemConfig(memory_dim=256, num_slots=512),
+    ponder = PonderConfig(N_H=3, N_L=6),
 )
 
 MEDIUM_CONFIG = SRLMConfig(
-    vocab_size     = TOTAL_VOCAB,
-    context_length = 256,
-    d_model        = 384,
-    n_priors       = 4,
-    n_posteriors   = 3,
-    n_heads        = 12,
+    gmem              = GMemConfig(memory_dim=384, num_slots=1024),
+    ponder            = PonderConfig(N_H=3, N_L=6),
+    hidden_dim        = 384,
+    num_heads         = 12,
+    front_layers      = 3,
+    back_layers       = 3,
+    max_context_length = 256,
 )
 
 LARGE_CONFIG = SRLMConfig(
-    vocab_size     = TOTAL_VOCAB,
-    context_length = 256,
-    d_model        = 1152,
-    n_priors       = 3,
-    n_posteriors   = 2,
-    n_heads        = 16,
-    dropout        = 0.2,
+    gmem              = GMemConfig(memory_dim=512, num_slots=2048),
+    ponder            = PonderConfig(N_H=3, N_L=6),
+    hidden_dim        = 768,
+    num_heads         = 12,
+    mlp_ratio         = 4,
+    front_layers      = 4,
+    back_layers       = 4,
+    max_context_length = 256,
+    dropout           = 0.1,
 )
+
 
 # ---------------------------------------------------------------------------
 # Utilities
@@ -94,14 +98,14 @@ def sample_batch_random(raw: torch.Tensor, seq_len: int, batch: int) -> torch.Te
     starts = torch.randint(0, N - seq_len, (batch,))
     return torch.stack([raw[s:s+seq_len] for s in starts])
 
+
 # ---------------------------------------------------------------------------
-# Checkpoint I/O (new format per spec)
+# Checkpoint I/O
 # ---------------------------------------------------------------------------
 
 def save_checkpoint(ckpt_dir: Path, model: nn.Module, config: SRLMConfig,
                     training_log: str, wiki_state: dict | None = None,
                     ema=None):
-    """Save checkpoint directory with all spec files."""
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     torch.save(model.state_dict(), ckpt_dir / "parameters.pt")
     if ema is not None:
@@ -115,46 +119,98 @@ def save_checkpoint(ckpt_dir: Path, model: nn.Module, config: SRLMConfig,
             json.dump(wiki_state, f)
     print(f"  Saved: {ckpt_dir}")
 
-def _strip_orig_mod(state_dict: dict) -> dict:
-    """Strip _orig_mod. prefix left by torch.compile when saving state."""
-    prefix = "_orig_mod."
-    if any(k.startswith(prefix) for k in state_dict):
-        return {k[len(prefix):]: v for k, v in state_dict.items()}
-    return state_dict
 
 def load_checkpoint(model: nn.Module, ckpt_dir: Path) -> bool:
-    """Load model parameters from checkpoint directory."""
     params = ckpt_dir / "parameters.pt"
     if not params.exists():
-        # Also try legacy format
-        legacy = ckpt_dir / "checkpoint.pt"
-        if legacy.exists():
-            state = torch.load(legacy, map_location="cpu")
-            model.load_state_dict(_strip_orig_mod(state["model"]))
-            print(f"  Loaded (legacy): {legacy}")
-            return True
         return False
-    model.load_state_dict(_strip_orig_mod(torch.load(params, map_location="cpu")))
+    state = torch.load(params, map_location="cpu")
+    prefix = "_orig_mod."
+    if any(k.startswith(prefix) for k in state):
+        state = {k[len(prefix):]: v for k, v in state.items()}
+    model.load_state_dict(state)
     print(f"  Loaded: {params}")
     return True
 
+
 def load_config(ckpt_dir: Path) -> SRLMConfig | None:
     cfg_path = ckpt_dir / "config.json"
-    if cfg_path.exists():
-        with open(cfg_path) as f:
-            d = json.load(f)
-        # Handle non-primitive fields
-        d.pop("outlet", None)
-        return SRLMConfig(**d)
-    return None
+    if not cfg_path.exists():
+        return None
+    with open(cfg_path) as f:
+        d = json.load(f)
+    gmem = GMemConfig(**d.pop("gmem"))
+    ponder = PonderConfig(**d.pop("ponder"))
+    return SRLMConfig(gmem=gmem, ponder=ponder, **d)
+
+
+# ---------------------------------------------------------------------------
+# Memory Replay Buffer (Anki-style, backed by G-Mem)
+# ---------------------------------------------------------------------------
+
+class MemoryReplayBuffer:
+    """
+    Stores recent (tokens, G-Mem state) pairs for memory-jogging replay.
+
+    The idea: after the model processes a batch, we snapshot the G-Mem
+    state. Later, we replay that batch with the stored memory context.
+    The model should reconstruct the old content better because memory
+    carries information from when it first saw it.
+
+    This teaches the model to actually use G-Mem for cross-segment
+    coherence rather than ignoring it.
+    """
+
+    def __init__(self, max_size: int = 100):
+        self.max_size = max_size
+        self.entries = []  # list of (tokens_cpu, memory_cpu, answer_mask_cpu_or_None)
+
+    def __len__(self):
+        return len(self.entries)
+
+    def store(self, tokens, memory, answer_mask=None):
+        """Store a training batch + its G-Mem snapshot."""
+        entry = (
+            tokens.detach().cpu(),
+            memory.detach().cpu(),
+            answer_mask.detach().cpu() if answer_mask is not None else None,
+        )
+        self.entries.append(entry)
+        while len(self.entries) > self.max_size:
+            self.entries.pop(0)
+
+    def sample(self, device):
+        """Randomly retrieve a stored batch and its memory context."""
+        idx = torch.randint(0, len(self.entries), ()).item()
+        tokens, memory, answer_mask = self.entries[idx]
+        return (
+            tokens.to(device),
+            memory.to(device),
+            answer_mask.to(device) if answer_mask is not None else None,
+        )
+
+    @torch.no_grad()
+    def refresh(self, denoiser, device):
+        """Re-encode all stored data with current model weights.
+
+        Keeps stored memories aligned with the evolving model so
+        old snapshots don't become stale / incompatible.
+        """
+        for i, (tokens, _, answer_mask) in enumerate(self.entries):
+            x0 = tokens.to(device)
+            t_zero = torch.zeros(x0.shape[0], device=device)
+            h, c, cos, sin = denoiser.input(x0, t_zero)
+            for layer in denoiser.front_layers:
+                h = layer(h, c, cos, sin)
+            _, memory, _ = denoiser.latent_memory(h, None)
+            self.entries[i] = (tokens, memory.detach().cpu(), answer_mask)
+
 
 # ---------------------------------------------------------------------------
 # Training programs
 # ---------------------------------------------------------------------------
 
 class KalevalaProgram:
-    """Trains on Kalevala text. Runs for `max_steps` steps (None = indefinite)."""
-
     def __init__(self, device, seq_len, batch_size, max_steps=None):
         self.device = device
         self.seq_len = seq_len
@@ -169,26 +225,19 @@ class KalevalaProgram:
         print(f"Kalevala: {self.raw.shape[0]:,} bytes")
 
     def done(self):
-        if self.max_steps is None:
-            return False
-        return self.step_count >= self.max_steps
+        return self.max_steps is not None and self.step_count >= self.max_steps
 
     def next_batch(self):
-        """Return (batch, None), or None if done."""
         if self.done():
             return None
         self.step_count += 1
         return sample_batch_random(self.raw, self.seq_len, self.batch_size), None
 
     def description(self):
-        if self.max_steps is None:
-            return f"kalevala(indefinite, done={self.step_count})"
-        return f"kalevala({self.max_steps}, done={self.step_count})"
+        return f"kalevala({self.max_steps or 'inf'}, done={self.step_count})"
 
 
 class WikipediaProgram:
-    """Trains on Wikipedia. Runs for `max_steps` steps or one epoch."""
-
     def __init__(self, seq_len, batch_size, max_steps=None, seed=42):
         self.seq_len = seq_len
         self.batch_size = batch_size
@@ -208,7 +257,6 @@ class WikipediaProgram:
         return self.loader.epoch_done()
 
     def next_batch(self):
-        """Return (batch, None), or None if done/exhausted."""
         if self.done():
             return None
         batch = self.loader.next_batch()
@@ -221,18 +269,11 @@ class WikipediaProgram:
         return self.loader.state_dict()
 
     def description(self):
-        if self.max_steps is not None:
-            return f"wikipedia({self.max_steps}, done={self.step_count})"
-        return f"wikipedia(epoch, done={self.step_count})"
+        return f"wikipedia({self.max_steps or 'epoch'}, done={self.step_count})"
 
-MASK_TOKEN = VOCAB_SIZE  # = 256, the absorbing state
 
 class ArithmeticProgram:
-    """Trains on N+M=Y facts. Problem shown unmasked; rest of buffer masked.
-
-    This teaches the model to predict the masked suffix given the arithmetic
-    fact as a visible prefix. Loss is computed only on masked positions.
-    """
+    """N+M=Y facts. Question shown, answer masked."""
 
     def __init__(self, seq_len, batch_size, max_steps=None, max_operand=99):
         self.seq_len = seq_len
@@ -242,50 +283,36 @@ class ArithmeticProgram:
         self.step_count = 0
 
     def done(self):
-        if self.max_steps is None:
-            return False
-        return self.step_count >= self.max_steps
+        return self.max_steps is not None and self.step_count >= self.max_steps
 
     def next_batch(self):
-        """Return (batch, perturbed_batch), or None if done.
-
-        batch:           clean tokens — problem prefix + spaces for the rest
-        perturbed_batch: problem prefix shown, rest filled with MASK_TOKEN
-        """
         if self.done():
             return None
-
-        batch_clean     = torch.full((self.batch_size, self.seq_len), ord(' '), dtype=torch.int32)
-        batch_perturbed = torch.full((self.batch_size, self.seq_len), MASK_TOKEN, dtype=torch.int32)
-
+        batch = torch.full((self.batch_size, self.seq_len), ord(' '), dtype=torch.int32)
+        answer_mask = torch.zeros(self.batch_size, self.seq_len, dtype=torch.bool)
         for i in range(self.batch_size):
             n = torch.randint(0, self.max_operand + 1, ()).item()
             m = torch.randint(0, self.max_operand + 1, ()).item()
             prompt = f"{n}+{m}="
             answer = f"{n+m}"
-            full   = prompt + answer
-            full_tokens   = torch.frombuffer(bytearray(full.encode()), dtype=torch.uint8).to(torch.int32)
-            prompt_tokens = torch.frombuffer(bytearray(prompt.encode()), dtype=torch.uint8).to(torch.int32)
-            L = min(len(full_tokens), self.seq_len)
-            batch_clean[i, :L] = full_tokens[:L]
-            # Only show the prompt; mask the answer and rest
-            P = min(len(prompt_tokens), self.seq_len)
-            batch_perturbed[i, :P] = prompt_tokens[:P]
-
+            full = prompt + answer
+            tokens = torch.frombuffer(bytearray(full.encode()), dtype=torch.uint8).to(torch.int32)
+            L = min(len(tokens), self.seq_len)
+            batch[i, :L] = tokens[:L]
+            p_len = len(prompt.encode())
+            answer_mask[i, p_len:L] = True
         self.step_count += 1
-        return batch_clean, batch_perturbed
+        return batch, answer_mask
 
     def description(self):
-        if self.max_steps is None:
-            return f"arithmetic(indefinite, done={self.step_count})"
-        return f"arithmetic({self.max_steps}, done={self.step_count})"
+        return f"arithmetic({self.max_steps or 'inf'}, done={self.step_count})"
 
 
 class SudokuProgram:
-    """Trains on sudoku puzzles. Puzzle clues shown unmasked; blanks masked.
+    """Sudoku puzzles. Clue positions shown, blank positions masked.
 
-    Format: 9 rows of 9 digits separated by newlines (90 bytes with newlines).
-    Zeros in puzzle become MASK_TOKEN; solution provides the clean target.
+    Format: 9 rows of 9 digits separated by newlines (89 bytes).
+    answer_mask is True where puzzle has '0' (blanks to predict).
     """
 
     def __init__(self, seq_len, batch_size, max_steps=None,
@@ -301,57 +328,47 @@ class SudokuProgram:
         print(f"Sudoku: {len(self.puzzles)} puzzles loaded")
 
     def _format_grid(self, digits_81):
-        """Turn '281953647...' into '281953647\\n476218593\\n...' (89 bytes)."""
         rows = [digits_81[i:i+9] for i in range(0, 81, 9)]
         return "\n".join(rows)
 
     def done(self):
-        if self.max_steps is None:
-            return False
-        return self.step_count >= self.max_steps
+        return self.max_steps is not None and self.step_count >= self.max_steps
 
     def next_batch(self):
         if self.done():
             return None
 
-        batch_clean     = torch.full((self.batch_size, self.seq_len), ord(' '), dtype=torch.int32)
-        batch_perturbed = torch.full((self.batch_size, self.seq_len), MASK_TOKEN, dtype=torch.int32)
+        batch = torch.full((self.batch_size, self.seq_len), ord(' '), dtype=torch.int32)
+        answer_mask = torch.zeros(self.batch_size, self.seq_len, dtype=torch.bool)
 
         for i in range(self.batch_size):
             idx = torch.randint(0, len(self.puzzles), ()).item()
             puzzle_grid   = self._format_grid(self.puzzles[idx])
             solution_grid = self._format_grid(self.solutions[idx])
 
-            sol_tokens = torch.frombuffer(bytearray(solution_grid.encode()), dtype=torch.uint8).to(torch.int32)
-            puz_tokens = torch.frombuffer(bytearray(puzzle_grid.encode()), dtype=torch.uint8).to(torch.int32)
+            sol_tokens = torch.frombuffer(
+                bytearray(solution_grid.encode()), dtype=torch.uint8).to(torch.int32)
+            puz_tokens = torch.frombuffer(
+                bytearray(puzzle_grid.encode()), dtype=torch.uint8).to(torch.int32)
 
             L = min(len(sol_tokens), self.seq_len)
-            batch_clean[i, :L] = sol_tokens[:L]
-            # Copy solution as base, then mask where puzzle has '0'
-            batch_perturbed[i, :L] = sol_tokens[:L]
+            batch[i, :L] = sol_tokens[:L]
+            # Mask where puzzle has '0'
             for j in range(L):
                 if puz_tokens[j] == ord('0'):
-                    batch_perturbed[i, j] = MASK_TOKEN
+                    answer_mask[i, j] = True
 
         self.step_count += 1
-        return batch_clean, batch_perturbed
+        return batch, answer_mask
 
     def description(self):
-        if self.max_steps is None:
-            return f"sudoku(indefinite, done={self.step_count})"
-        return f"sudoku({self.max_steps}, done={self.step_count})"
+        return f"sudoku({self.max_steps or 'inf'}, done={self.step_count})"
 
 
 class QAProgram:
-    """Trains on question-answer pairs from a JSONL file.
-
-    Each entry is formatted as "{question} {answer}". The question + separator
-    space are shown unmasked; the answer is masked. Loss is computed only on
-    masked (answer) positions.
-    """
+    """Question-answer pairs from JSONL. Question shown, answer masked."""
 
     def __init__(self, path, seq_len, batch_size, max_steps=None):
-        import json
         self.seq_len    = seq_len
         self.batch_size = batch_size
         self.max_steps  = max_steps
@@ -367,64 +384,34 @@ class QAProgram:
         print(f"QA: {len(self.pairs)} pairs loaded from {path}")
 
     def done(self):
-        if self.max_steps is None:
-            return False
-        return self.step_count >= self.max_steps
+        return self.max_steps is not None and self.step_count >= self.max_steps
 
     def next_batch(self):
-        """Return (batch, perturbed_batch), or None if done.
-
-        batch:           clean tokens — full question + space + answer + spaces
-        perturbed_batch: question + space shown, answer positions masked
-        """
         if self.done():
             return None
 
-        batch_clean     = torch.full((self.batch_size, self.seq_len), ord(' '), dtype=torch.int32)
-        batch_perturbed = torch.full((self.batch_size, self.seq_len), MASK_TOKEN, dtype=torch.int32)
+        batch = torch.full((self.batch_size, self.seq_len), ord(' '), dtype=torch.int32)
+        answer_mask = torch.zeros(self.batch_size, self.seq_len, dtype=torch.bool)
 
         indices = torch.randint(0, len(self.pairs), (self.batch_size,))
         for i, idx in enumerate(indices.tolist()):
             question, answer = self.pairs[idx]
             prefix = question + " "
             full   = prefix + answer
-            prefix_tok = torch.frombuffer(bytearray(prefix.encode()), dtype=torch.uint8).to(torch.int32)
-            full_tok   = torch.frombuffer(bytearray(full.encode()),   dtype=torch.uint8).to(torch.int32)
+            prefix_tok = torch.frombuffer(
+                bytearray(prefix.encode()), dtype=torch.uint8).to(torch.int32)
+            full_tok = torch.frombuffer(
+                bytearray(full.encode()), dtype=torch.uint8).to(torch.int32)
+            Lf = min(len(full_tok), self.seq_len)
             Lp = min(len(prefix_tok), self.seq_len)
-            Lf = min(len(full_tok),   self.seq_len)
-            batch_clean[i, :Lf]     = full_tok[:Lf]
-            batch_perturbed[i, :Lp] = prefix_tok[:Lp]   # answer stays masked
+            batch[i, :Lf] = full_tok[:Lf]
+            answer_mask[i, Lp:Lf] = True
 
         self.step_count += 1
-        return batch_clean, batch_perturbed
+        return batch, answer_mask
 
     def description(self):
-        if self.max_steps is None:
-            return f"qa(indefinite, done={self.step_count})"
-        return f"qa({self.max_steps}, done={self.step_count})"
-
-# ---------------------------------------------------------------------------
-# Score function wrapper for sampler
-# ---------------------------------------------------------------------------
-
-def make_score_fn(model, device, d_model, memories=None, max_act_steps=8):
-    @torch.no_grad()
-    def score_fn(x, sigma):
-        x = x.to(device)
-        sigma = sigma.to(device)
-        B, L = x.shape
-        z = make_z(B, L, d_model, device=device)
-
-        # Adaptive computation: recur() is cheap (HRM + Q_head only),
-        # head() (posterior + output) runs once at the end
-        ix = model.front(x, sigma, memories=memories)
-        for _ in range(max_act_steps):
-            z, y, q = model.recur(z, ix)
-            if (q.squeeze(-1) > 0).all():
-                break
-        log_score, _aux = model.head(y, ix)
-        return log_score
-    return score_fn
+        return f"qa({self.max_steps or 'inf'}, done={self.step_count})"
 
 
 # ---------------------------------------------------------------------------
@@ -436,86 +423,82 @@ def cmd_train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    # Resolve config: checkpoint > preset flag > default
+    # Config: checkpoint > preset > default
     ckpt_path = cwd / args.checkpoint
-    base = load_config(ckpt_path)
-    if base is None:
-        base = LARGE_CONFIG if args.large else MEDIUM_CONFIG if args.medium else DEFAULT_CONFIG
-        # large > medium > default
-    config = SRLMConfig(
-        vocab_size       = base.vocab_size,
-        context_length   = args.seq_len or base.context_length,
-        d_model          = args.d_model or base.d_model,
-        n_priors         = args.n_priors if args.n_priors is not None else base.n_priors,
-        n_posteriors     = args.n_posteriors if args.n_posteriors is not None else base.n_posteriors,
-        n_heads          = args.n_heads or base.n_heads,
-        dropout          = args.dropout if args.dropout is not None else base.dropout,
-        N                = args.N if args.N is not None else base.N,
-        T                = args.T if args.T is not None else base.T,
-    )
+    config = load_config(ckpt_path)
+    if config is None:
+        if args.large:
+            config = LARGE_CONFIG
+        elif args.medium:
+            config = MEDIUM_CONFIG
+        else:
+            config = DEFAULT_CONFIG
 
-    seq_len     = config.context_length
-    batch_size  = args.batch_size
-    supervision = args.supervision
-    save_every  = args.save_every
-    report_every = args.report_every
+    # CLI overrides
+    if args.seq_len:
+        config.max_context_length = args.seq_len
+    if args.hidden_dim:
+        config.hidden_dim = args.hidden_dim
+        config.gmem.memory_dim = args.hidden_dim
+    if args.num_heads:
+        config.num_heads = args.num_heads
 
-    # Noise schedule
-    schedule = LogLinearSchedule()
+    seq_len    = config.max_context_length
+    batch_size = args.batch_size
+    schedule   = LogLinearSchedule(eps=1e-3)
 
-    from model.srlm import ScoreTransformer
     # Model
     print("Initialising model...")
-    model = SRLM(config).to(device)
-    model = ScoreTransformer(257, config.context_length,
-                             dim=256,
-                             num_heads=4,
-                             num_layers=4).to(device)
-    model.cfg = config
-    sampler = Sampler(model, 257)
-    # Load existing checkpoint
-    load_checkpoint(model, ckpt_path)
-    no_compile = getattr(args, 'no_compile', False)
-    #if not no_compile:
-        # Compile stable submodules individually — the top-level forward
-        # has variable graph shape when memories change the block count.
-    #    for layer in model.prior:
-    #        layer.compile()
-    #    model.main.compile()
-    #    for layer in model.posterior:
-    #        layer.compile()
-    print(f"Parameters:       {param_count(model):,}")
-    print(f"Parameter memory: {param_memory_mb(model):.1f} MB")
+    denoiser = SRLMDenoiser(config).to(device)
+    load_checkpoint(denoiser, ckpt_path)
+    print(f"Parameters:       {param_count(denoiser):,}")
+    print(f"Parameter memory: {param_memory_mb(denoiser):.1f} MB")
 
-    # LoRA for GRPO — apply adapters, create separate optimizer
-    lora_layers = []
-    grpo_optimizer = None
-    if args.lora_rank > 0 and args.grpo_every > 0:
-        lora_layers = apply_lora(model, rank=args.lora_rank, alpha=args.lora_alpha)
-        lora_params = lora_parameters(model)
-        n_lora = sum(p.numel() for p in lora_params)
-        print(f"LoRA: rank={args.lora_rank}, alpha={args.lora_alpha}, "
-              f"{len(lora_layers)} layers, {n_lora:,} trainable params")
-        grpo_optimizer = optim.AdamW(lora_params, lr=args.lr, weight_decay=0.003)
+    optimizer = optim.AdamW(denoiser.parameters(), lr=args.lr, weight_decay=0.01)
+    ema = EMA(denoiser, mu=0.999)
 
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)# weight_decay=0.003)
-
-    # Separate GRPO optimizer to prevent Adam momentum corruption
-    # GRPO gradients have very different scale/statistics from SEDD gradients;
-    # sharing an optimizer causes progressive instability and eventual divergence
-    if args.grpo_every > 0 and grpo_optimizer is None:
-        grpo_optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
-
-    # EMA for training stability (TRM uses mu=0.999)
-    ema = EMA(model, mu=0.999)
     ema_path = ckpt_path / "ema.pt"
     if ema_path.exists():
         ema.load_state_dict(torch.load(ema_path, map_location=device, weights_only=True))
         print(f"Loaded EMA from {ema_path}")
 
-    # loss_fn and train_step removed — deep_supervision_step handles everything
+    # Ponder trainer
+    ponder_trainer = PonderTrainer(
+        denoiser=denoiser,
+        schedule=schedule,
+        N_super=args.supervision,
+    )
 
-    # Build training programs
+    # Memory replay buffer (Anki-style)
+    use_memory = args.memory_size > 0
+    memory_alternate = args.memory_alternate
+    replay_buffer = MemoryReplayBuffer(max_size=args.memory_size) if use_memory else None
+    if use_memory:
+        if memory_alternate > 0:
+            print(f"Memory replay: size={args.memory_size}, "
+                  f"alternate every {memory_alternate}, "
+                  f"refresh every {args.memory_refresh}")
+        else:
+            print(f"Memory replay: size={args.memory_size}, "
+                  f"refresh every {args.memory_refresh}")
+
+    # LR schedule
+    warmup_steps = args.warmup_steps
+    cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(args.save_every, 1000), eta_min=1e-6
+    )
+    if warmup_steps > 0:
+        warmup_scheduler = optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=1e-2, end_factor=1.0, total_iters=warmup_steps
+        )
+        scheduler = optim.lr_scheduler.SequentialLR(
+            optimizer, schedulers=[warmup_scheduler, cosine_scheduler],
+            milestones=[warmup_steps]
+        )
+    else:
+        scheduler = cosine_scheduler
+
+    # Training programs
     programs = []
     if args.kalevala is not None:
         max_steps = None if args.kalevala == 0 else args.kalevala
@@ -532,53 +515,23 @@ def cmd_train(args):
     if args.qa is not None:
         max_steps = None if args.qa == 0 else args.qa
         programs.append(QAProgram(args.qa_file, seq_len, batch_size, max_steps))
-
     if not programs:
         print("No training programs specified. Use --kalevala and/or --wikipedia.")
         sys.exit(1)
 
-    # Training log — preserve history from previous runs
+    # Training log
     training_log_lines = []
     prev_log = ckpt_path / "training.txt"
     if prev_log.exists():
         training_log_lines.append(prev_log.read_text().rstrip())
-        training_log_lines.append("")  # blank line separator
+        training_log_lines.append("")
     start_time = datetime.now()
     training_log_lines.append(f"started: {start_time.isoformat()}")
     for p in programs:
         training_log_lines.append(f"program: {p.description()}")
 
-    # Create checkpoint dir and loss.txt
     ckpt_path.mkdir(parents=True, exist_ok=True)
     loss_fd = open(ckpt_path / "loss.txt", "w")
-
-    # Scheduler: linear warmup then cosine decay
-    warmup_steps = args.warmup_steps
-    cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=max(save_every, 1000), eta_min=1e-6
-    )
-    if warmup_steps > 0:
-        warmup_scheduler = optim.lr_scheduler.LinearLR(
-            optimizer, start_factor=1e-2, end_factor=1.0, total_iters=warmup_steps
-        )
-        scheduler = optim.lr_scheduler.SequentialLR(
-            optimizer, schedulers=[warmup_scheduler, cosine_scheduler],
-            milestones=[warmup_steps]
-        )
-    else:
-        scheduler = cosine_scheduler
-
-    # Memory bank (Anki-style rolling recall with alternation)
-    use_memory = args.memory_size > 0
-    memory_alternate = args.memory_alternate
-    if use_memory:
-        memory_bank = MemoryBank()
-        if memory_alternate > 0:
-            print(f"Memory bank: size={args.memory_size}, k={args.memory_k}, "
-                  f"refresh every {args.memory_refresh}, alternate every {memory_alternate}")
-        else:
-            print(f"Memory bank: size={args.memory_size}, k={args.memory_k}, "
-                  f"refresh every {args.memory_refresh}")
 
     print(f"Training | programs: {[p.description() for p in programs]}")
     print("-" * 55)
@@ -586,224 +539,208 @@ def cmd_train(args):
     global_step = 0
     running_loss = 0.0
     program_idx = 0
-    last_grpo_info = ""
     ema_loss = None
+    memory = None  # G-Mem state, threads across steps
 
     try:
         while True:
-            # Check if all programs are done
             if all(p.done() for p in programs):
                 break
 
-            # Pick next program: interleave or sequential
-            if args.interleave > 0 and len(programs) > 1:
-                # Switch program every N steps
-                program_idx = (global_step // args.interleave) % len(programs)
-                # Skip done programs
-                attempts = 0
-                while programs[program_idx].done():
-                    program_idx = (program_idx + 1) % len(programs)
-                    attempts += 1
-                    if attempts > len(programs):
-                        break
+            # Pick next active program
+            attempts = 0
+            while programs[program_idx].done():
+                program_idx = (program_idx + 1) % len(programs)
+                attempts += 1
                 if attempts > len(programs):
                     break
-            else:
-                # Sequential: stay on current until done
-                attempts = 0
-                while programs[program_idx].done():
-                    program_idx = (program_idx + 1) % len(programs)
-                    attempts += 1
-                    if attempts > len(programs):
-                        break
-                if attempts > len(programs):
-                    break
+            if attempts > len(programs):
+                break
 
             program = programs[program_idx]
-
-            # Get batch from program
             result = program.next_batch()
             if result is None:
                 program_idx = (program_idx + 1) % len(programs)
                 continue
-            batch, perturbed_batch = result
+            batch, answer_mask = result
+            x0 = batch.to(device)
+            if answer_mask is not None:
+                answer_mask = answer_mask.to(device)
 
-            # Determine if memory is active this step (alternation)
+            is_reasoning = isinstance(program, (SudokuProgram, ArithmeticProgram))
+
+            # Determine if this is a study or practice step
             if use_memory and memory_alternate > 0:
                 memory_active = ((global_step // memory_alternate) % 2) == 0
             else:
-                memory_active = use_memory
+                memory_active = False  # no alternation = no replay
 
-            # Store this batch in the memory bank (always, even during off phase)
-            if use_memory:
-                model.eval()
-                memory_bank.encode(model, [batch], device)
-                model.train()
-                while len(memory_bank) > args.memory_size:
-                    memory_bank.tokens.pop(0)
-                    memory_bank.memories.pop(0)
-                    memory_bank.summaries.pop(0)
+            ponder_info = ""
 
-            # Anki: replay with memories during on-phase, fresh without during off-phase
-            memories = None
-            if memory_active and len(memory_bank) >= args.memory_k + 1:
-                idx = torch.randint(0, len(memory_bank), ()).item()
-                batch = memory_bank.tokens[idx].to(device)
-                perturbed_batch = None
-                with torch.no_grad():
-                    query = model.input.input_emb(batch.clamp(0, config.vocab_size - 1))
-                memories = memory_bank.retrieve(query, args.memory_k)
-
-            # GRPO reinforcement step (for verifiable tasks)
-            use_grpo = args.grpo_every > 0
-            do_grpo = (use_grpo
-                       and global_step > 0
-                       and global_step % args.grpo_every == 0
-                       and isinstance(program, (ArithmeticProgram, SudokuProgram)))
-
-            if do_grpo:
-                # Pick reward function based on active program
-                if isinstance(program, ArithmeticProgram):
-                    reward_fn = arithmetic_reward
-                    grpo_task = "arithmetic"
-                else:
-                    reward_fn = lambda tok: sudoku_reward(tok, None)
-                    grpo_task = "sudoku"
-
-                # Build prompt: for arithmetic, generate fresh prompts
-                # For sudoku, use the perturbed batch (puzzle with masks)
-                if perturbed_batch is not None:
-                    grpo_prompt = perturbed_batch.to(device)
-                else:
-                    grpo_prompt = batch.to(device)
-                    # For arithmetic without explicit perturbed_batch,
-                    # re-fetch a batch to get proper prompts (don't count as a step)
-                    result = program.next_batch()
-                    if result is not None:
-                        program.step_count -= 1  # don't double-count
-                        batch, perturbed_batch = result
-                        grpo_prompt = perturbed_batch.to(device) if perturbed_batch is not None else batch.to(device)
-                        batch = batch  # clean target
-
-                z = make_z(batch_size, seq_len, config.d_model, device=device)
-                grpo_opt = grpo_optimizer if grpo_optimizer is not None else optimizer
-                grpo_loss, z, grpo_metrics = grpo_step(
-                    model, grpo_opt, schedule,
-                    grpo_prompt, batch.to(device), reward_fn, z, device,
-                    memories=memories,
-                    K=args.grpo_k,
-                    sampling_steps=args.grpo_steps,
-                    epochs=args.grpo_epochs,
-                    verbose=args.print_grpo,
-                    beta_dgpo=args.grpo_beta,
-                    fused=args.grpo_fused,
-                    max_act_steps=args.grpo_act_steps,
+            if is_reasoning:
+                # --- Reasoning tasks: always use ponder deep supervision ---
+                ponder_losses, memory = ponder_trainer.train_step(
+                    x0, optimizer, memory, answer_mask=answer_mask,
                 )
-                avg_session = grpo_loss
-                last_grpo_info = (f" | GRPO({grpo_task}) r={grpo_metrics['mean_reward']:.2f}"
-                                  f" ok={grpo_metrics['frac_correct']:.0%}"
-                                  f" max={grpo_metrics['max_reward']:.2f}")
-            else:
-                # TRM-style deep supervision: front() once, step() N times
-                z = make_z(batch_size, seq_len, config.d_model, device=device)
-                batch_dev = batch.to(device)
-                pb_dev = perturbed_batch.to(device) if perturbed_batch is not None else None
-                #print(repr(as_text(batch_dev[0])))
-                model.train()
-                optimizer.zero_grad()
-                loss = score_entropy_loss(model,
-                                          batch_dev,
-                                          257,
-                                          sampler.schedule)
-                #loss = sampler.score_entropy_loss(batch_dev)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
+                ema.update(denoiser)
+                avg_loss = ponder_losses['LM']
+                ponder_info = (f" | ponder LM={ponder_losses['LM']:.4f}"
+                               f" BCE={ponder_losses['BCE']:.4f}")
 
-                avg_session = loss.item()
-                
-                #avg_session, z = deep_supervision_step(
-                #    model, optimizer, schedule, z, batch_dev,
-                #    n_supervision=supervision,
-                #    perturbed_batch=pb_dev,
-                #    memories=memories,
-                #    ema=ema,
-                #)
-            running_loss += avg_session
+                # Store in replay buffer
+                if replay_buffer is not None and memory is not None:
+                    replay_buffer.store(x0, memory, answer_mask)
+
+                # --- GRPO reinforcement (interleaved) ---
+                if (args.grpo_every > 0
+                        and global_step % args.grpo_every == 0
+                        and global_step > 0):
+                    if isinstance(program, ArithmeticProgram):
+                        reward_fn = arithmetic_reward
+                    else:
+                        reward_fn = sudoku_reward
+                    # Build prompt: mask answer positions
+                    prompt = x0.clone()
+                    if answer_mask is not None:
+                        prompt[answer_mask] = MASK_TOKEN
+                    grpo_loss, memory, grpo_metrics = grpo_step(
+                        denoiser, optimizer, schedule,
+                        prompt_batch=prompt,
+                        clean_batch=x0,
+                        reward_fn=reward_fn,
+                        device=device,
+                        memory=memory,
+                        answer_mask=answer_mask,
+                        K=args.grpo_k,
+                        sampling_steps=args.grpo_steps,
+                        use_ponder=True,
+                        n_ponder=3,
+                        verbose=(global_step % args.report_every == 0),
+                    )
+                    ema.update(denoiser)
+                    ponder_info += (f" | grpo={grpo_loss:.4f}"
+                                    f" r={grpo_metrics['mean_reward']:.3f}")
+
+            # --- Study phase: train on fresh data, store in replay buffer ---
+            elif not memory_active or replay_buffer is None or len(replay_buffer) == 0:
+                denoiser.train()
+                optimizer.zero_grad()
+
+                loss, memory, importance_scores = mdlm_loss(
+                    denoiser, x0, schedule, memory,
+                    answer_mask=answer_mask,
+                )
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(denoiser.parameters(), 1.0)
+                optimizer.step()
+                ema.update(denoiser)
+
+                if memory is not None:
+                    memory = memory.detach()
+
+                # Store in replay buffer
+                if replay_buffer is not None and memory is not None:
+                    replay_buffer.store(x0, memory, answer_mask)
+
+                avg_loss = loss.item()
+
+                # Ponder step (interleaved for non-reasoning tasks)
+                if args.ponder_every > 0 and global_step % args.ponder_every == 0:
+                    ponder_losses, memory = ponder_trainer.train_step(
+                        x0, optimizer, memory, answer_mask=answer_mask,
+                    )
+                    ponder_info = f" | ponder LM={ponder_losses['LM']:.4f}"
+
+            # --- Practice phase: replay old data with stored memory context ---
+            else:
+                replay_x0, replay_mem, replay_mask = replay_buffer.sample(device)
+                denoiser.train()
+                optimizer.zero_grad()
+
+                loss, memory, importance_scores = mdlm_loss(
+                    denoiser, replay_x0, schedule, replay_mem,
+                    answer_mask=replay_mask,
+                )
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(denoiser.parameters(), 1.0)
+                optimizer.step()
+                ema.update(denoiser)
+
+                if memory is not None:
+                    memory = memory.detach()
+
+                avg_loss = loss.item()
+
+            running_loss += avg_loss
             global_step += 1
 
-            loss_fd.write(f"{global_step} {avg_session}\n")
+            loss_fd.write(f"{global_step} {avg_loss}\n")
             loss_fd.flush()
 
-            if math.isnan(avg_session):
-                print("Training failed — NaN loss")
+            if math.isnan(avg_loss):
+                print("Training failed -- NaN loss")
                 sys.exit(1)
 
-            if global_step % report_every == 0:
-                avg = running_loss / report_every
-                ema_loss = avg if ema_loss is None else 0.99 * ema_loss + 0.01 * avg
+            # Periodic memory refresh
+            if (replay_buffer is not None
+                    and global_step % args.memory_refresh == 0
+                    and len(replay_buffer) > 0):
+                denoiser.eval()
+                replay_buffer.refresh(denoiser, device)
+                denoiser.train()
 
-                if use_memory:
-                    phase = "study" if memory_active else "practice"
-                    mem_info = f" | {phase} ({len(memory_bank)})"
-                else:
-                    mem_info = ""
+            if global_step % args.report_every == 0:
+                avg = running_loss / args.report_every
+                ema_loss = avg if ema_loss is None else 0.99 * ema_loss + 0.01 * avg
                 prog_name = program.description().split("(")[0]
-                print(f"  step {global_step:6d} | loss {avg:.4f} | ema {ema_loss:.4f} | {prog_name} | lr {scheduler.get_last_lr()[0]:.2e}{mem_info}{last_grpo_info}")
-                last_grpo_info = ""
+                lr = scheduler.get_last_lr()[0]
+                phase = ""
+                if use_memory:
+                    if memory_active and len(replay_buffer) > 0:
+                        phase = f" | practice ({len(replay_buffer)})"
+                    else:
+                        phase = f" | study ({len(replay_buffer) if replay_buffer else 0})"
+                print(f"  step {global_step:6d} | loss {avg:.4f} | ema {ema_loss:.4f}"
+                      f" | {prog_name} | lr {lr:.2e}{phase}{ponder_info}")
                 running_loss = 0.0
 
-            # Periodic memory refresh — re-encode with improved model
-            if use_memory and global_step % args.memory_refresh == 0 and len(memory_bank) > 0:
-                model.eval()
-                memory_bank.refresh(model, device)
-                model.train()
-
-            if global_step % save_every == 0:
-                if lora_layers:
-                    merge_lora(model)
+            if global_step % args.save_every == 0:
                 wiki_state = None
                 for p in programs:
                     if isinstance(p, WikipediaProgram):
                         wiki_state = p.wiki_state()
-                elapsed = datetime.now() - start_time
                 log = "\n".join(training_log_lines)
-                log += f"\nsaved at step {global_step}, elapsed {elapsed}"
-                save_checkpoint(ckpt_path, model, config, log, wiki_state, ema=ema)
-                if lora_layers:
-                    unmerge_lora(model)
+                log += f"\nsaved at step {global_step}"
+                save_checkpoint(ckpt_path, denoiser, config, log, wiki_state, ema=ema)
+
+            if global_step % args.sample_every == 0:
+                denoiser.eval()
+                ema.apply(denoiser)
+                s, _ = sample(denoiser, schedule, batch_size=2, seq_len=seq_len,
+                              num_steps=64, device=device)
+                for i in range(min(2, s.shape[0])):
+                    print(f"    sample {i+1}: {repr(as_text(s[i][:80]))}")
+                ema.restore(denoiser)
 
             scheduler.step()
             program_idx = (program_idx + 1) % len(programs)
 
     except KeyboardInterrupt:
-        print("\nInterrupted. Press Ctrl+C again to exit WITHOUT saving, or wait...")
-        try:
-            import time; time.sleep(2)
-        except KeyboardInterrupt:
-            print("Exiting WITHOUT saving.")
-            loss_fd.close()
-            return
+        print("\nInterrupted.")
 
     loss_fd.close()
+
     # Final save
     elapsed = datetime.now() - start_time
     training_log_lines.append(f"finished: {datetime.now().isoformat()}")
-    training_log_lines.append(f"elapsed: {elapsed}")
-    training_log_lines.append(f"total steps: {global_step}")
-    for p in programs:
-        training_log_lines.append(f"final: {p.description()}")
+    training_log_lines.append(f"total steps: {global_step}, elapsed: {elapsed}")
     log = "\n".join(training_log_lines)
-
-    if lora_layers:
-        merge_lora(model)
 
     wiki_state = None
     for p in programs:
         if isinstance(p, WikipediaProgram):
             wiki_state = p.wiki_state()
-
-    save_checkpoint(ckpt_path, model, config, log, wiki_state, ema=ema)
+    save_checkpoint(ckpt_path, denoiser, config, log, wiki_state, ema=ema)
     print(f"Done. {global_step} steps in {elapsed}.")
 
 
@@ -815,117 +752,60 @@ def cmd_eval(args):
     ckpt_path = cwd / args.checkpoint
     config = load_config(ckpt_path)
     if config is None:
-        print(f"No config.json found in {ckpt_path}, using defaults.")
+        print(f"No config.json in {ckpt_path}, using defaults.")
         config = DEFAULT_CONFIG
 
-    seq_len = args.seq_len or config.context_length
-    steps   = args.steps
-
-    schedule = LogLinearSchedule()
+    seq_len = args.seq_len or config.max_context_length
+    schedule = LogLinearSchedule(eps=1e-3)
 
     print("Initialising model...")
-    model = SRLM(config).to(device)
-    if not load_checkpoint(model, ckpt_path):
+    denoiser = SRLMDenoiser(config).to(device)
+    if not load_checkpoint(denoiser, ckpt_path):
         print(f"No checkpoint found at {ckpt_path}")
         sys.exit(1)
 
-    # Load EMA weights for eval if requested
-    if getattr(args, 'ema', False):
+    if args.ema:
         ema_path = ckpt_path / "ema.pt"
         if ema_path.exists():
-            ema = EMA(model, mu=0.999)
+            ema = EMA(denoiser, mu=0.999)
             ema.load_state_dict(torch.load(ema_path, map_location=device, weights_only=True))
-            ema.apply(model)
-            print("Using EMA weights for eval")
+            ema.apply(denoiser)
+            print("Using EMA weights")
         else:
             print("Warning: --ema requested but no ema.pt found")
 
-    no_compile = getattr(args, 'no_compile', False)
-    if not no_compile:
-        for layer in model.prior:
-            layer.compile()
-        model.main.compile()
-        for layer in model.posterior:
-            layer.compile()
-        model.output.compile()
-    model.eval()
+    denoiser.eval()
+    print(f"Parameters: {param_count(denoiser):,}")
 
+    memory = None
     puzzles = None
     solutions = None
 
-    # Memory bank for eval
-    memory_bank = None
-    memories = None
-    if args.memory_size > 0:
-        memory_bank = MemoryBank()
-        print(f"Memory bank enabled: size={args.memory_size}, k={args.memory_k}")
-
-    act_steps = getattr(args, 'act_steps', 8)
-    score_fn = make_score_fn(model, device, config.d_model, memories=memories, max_act_steps=act_steps)
-
     while True:
-        query_text = input("> ")
-        query = from_text(query_text)
+        try:
+            query_text = input("> ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
 
-        # Commands
         if query_text.strip() == "!reset":
-            print("Reset (z is now per-call, nothing to reset).")
+            memory = None
+            print("Memory reset.")
             continue
-
-        if query_text.strip() == "!remember" and memory_bank is not None:
-            # Encode the last generation into memory
-            if hasattr(cmd_eval, '_last_output'):
-                tokens = from_text(cmd_eval._last_output)
-                if tokens is not None:
-                    batch = tokens.unsqueeze(0).to(device)
-                    memory_bank.encode(model, [batch], device)
-                    while len(memory_bank) > args.memory_size:
-                        memory_bank.tokens.pop(0)
-                        memory_bank.memories.pop(0)
-                        memory_bank.summaries.pop(0)
-                    print(f"Remembered. Bank: {len(memory_bank)} entries.")
-            continue
-
-        if query_text.strip().startswith("!feed ") and memory_bank is not None:
-            # Encode arbitrary text into memory
-            text = query_text.strip()[6:]
-            tokens = from_text(text)
-            if tokens is not None:
-                batch = tokens.unsqueeze(0).to(device)
-                memory_bank.encode(model, [batch], device)
-                while len(memory_bank) > args.memory_size:
-                    memory_bank.tokens.pop(0)
-                    memory_bank.memories.pop(0)
-                    memory_bank.summaries.pop(0)
-                print(f"Fed into memory. Bank: {len(memory_bank)} entries.")
-            continue
-
-        # Retrieve memories for this query
-        if memory_bank is not None and len(memory_bank) >= args.memory_k:
-            if query is not None:
-                with torch.no_grad():
-                    q_emb = model.input.input_emb(query.unsqueeze(0).clamp(0, config.vocab_size - 1).to(device))
-                memories = memory_bank.retrieve(q_emb, args.memory_k)
-            score_fn = make_score_fn(model, device, config.d_model, memories=memories, max_act_steps=act_steps)
-        else:
-            score_fn = make_score_fn(model, device, config.d_model, max_act_steps=act_steps)
 
         if query_text.strip() == "!sudoku":
             if puzzles is None:
                 import pandas as pd
-                cwd    = Path.cwd()
-                parquet_path = cwd / "../../data/valid_0.parquet"
+                parquet_path = Path.cwd() / "../../data/valid_0.parquet"
                 df = pd.read_parquet(parquet_path)
                 puzzles   = df["puzzle"].values
                 solutions = df["solution"].values
                 print(f"Loaded {len(puzzles)} puzzles")
-            def format_grid(digits_81):
-                rows = [digits_81[i:i+9] for i in range(0, 81, 9)]
-                return "\n".join(rows)
-            def parse_grid(text_89):
-                return text_89.replace("\n", "")
-            idx = torch.randint(0, len(puzzles), ()).item()
 
+            def format_grid(digits_81):
+                return "\n".join(digits_81[i:i+9] for i in range(0, 81, 9))
+
+            idx = torch.randint(0, len(puzzles), ()).item()
             puzzle = puzzles[idx]
             solution = solutions[idx]
             missing = puzzle.count('0')
@@ -937,28 +817,30 @@ def cmd_eval(args):
             print(puzzle_grid.replace('0', '.'))
             print()
 
-            sol_tokens = torch.frombuffer(bytearray(solution_grid.encode()), dtype=torch.uint8).to(torch.int32)
-            puz_tokens = torch.frombuffer(bytearray(puzzle_grid.encode()), dtype=torch.uint8).to(torch.int32)
+            sol_tokens = torch.frombuffer(
+                bytearray(solution_grid.encode()), dtype=torch.uint8).to(torch.int32)
+            puz_tokens = torch.frombuffer(
+                bytearray(puzzle_grid.encode()), dtype=torch.uint8).to(torch.int32)
             clue_mask = (puz_tokens != ord('0'))
             clue_values = sol_tokens.clone()
 
-            def projector(x, clue_mask=clue_mask, clue_values=clue_values):
-                cm = clue_mask.to(x.device)
-                cv = clue_values.to(x.device)
-                L = min(len(cm), x.shape[1])
-                x[:, :L] = torch.where(cm[:L], cv[:L], x[:, :L])
-                return x
+            # Conditional sampling: clamp clue positions each step
+            sampler_obj = Sampler(schedule, MASK_TOKEN, VOCAB_SIZE)
+            xt, stepper = sampler_obj(1, seq_len, device, args.steps)
+            q_len = min(len(clue_values), seq_len)
+            cm = clue_mask[:q_len].to(device)
+            cv = clue_values[:q_len].to(device)
+            xt[0, :q_len] = torch.where(cm, cv, xt[0, :q_len])
 
-            xt = sample_conditional(
-                score_fn, projector,
-                batch=1, seq_len=seq_len, vocab_size=TOTAL_VOCAB,
-                schedule=schedule, num_steps=steps,
-                device=device,
-            )
-            outputs = [as_text(xi) for xi in xt]
+            with torch.no_grad():
+                for step in stepper:
+                    logits, memory, _ = denoiser(xt, step.t, memory)
+                    x0 = step.propose_x0(xt, logits)
+                    xt = step.reverse_step(xt, x0)
+                    xt[0, :q_len] = torch.where(cm, cv, xt[0, :q_len])
 
-            result_text = outputs[0][:89]
-            result_digits = parse_grid(result_text)
+            result_text = as_text(xt[0])[:89]
+            result_digits = result_text.replace("\n", "")
 
             correct = 0
             total_blanks = 0
@@ -970,161 +852,105 @@ def cmd_eval(args):
 
             print(f"Model output:")
             print(result_text)
-            print(f"\nScore: {correct}/{total_blanks} blanks correct ({100*correct/max(total_blanks,1):.0f}%)")
-
+            print(f"\nScore: {correct}/{total_blanks} blanks correct "
+                  f"({100*correct/max(total_blanks,1):.0f}%)")
             if correct < total_blanks:
                 print(f"\nSolution:")
                 print(solution_grid)
             print()
-            cmd_eval._last_output = result_text
+            continue
+
+        query = from_text(query_text)
+
+        if query is not None and len(query) > 0:
+            # Conditional sampling: clamp query prefix each step
+            q = query.to(device)
+            q_len = min(len(q), seq_len)
+
+            sampler_obj = Sampler(schedule, MASK_TOKEN, VOCAB_SIZE)
+            xt, stepper = sampler_obj(1, seq_len, device, args.steps)
+            xt[0, :q_len] = q[:q_len]
+
+            with torch.no_grad():
+                for step in stepper:
+                    logits, memory, _ = denoiser(xt, step.t, memory)
+                    x0 = step.propose_x0(xt, logits)
+                    xt = step.reverse_step(xt, x0)
+                    xt[0, :q_len] = q[:q_len]
+
+            print(as_text(xt[0]))
         else:
-            if query is not None:
-                def projector(x, q=query):
-                    q_dev = q.to(x.device)
-                    x[:, :len(q_dev)] = q_dev
-                    return x
-                xt = sample_conditional(
-                    score_fn, projector,
-                    batch=1, seq_len=seq_len, vocab_size=TOTAL_VOCAB,
-                    schedule=schedule, num_steps=steps,
-                    device=device,
-                )
-            else:
-                xt = sample(
-                    score_fn, batch=1, d=seq_len, n=TOTAL_VOCAB,
-                    schedule=schedule, num_steps=steps,
-                    device=device,
-                )
-            outputs = [as_text(xi) for xi in xt]
-            for out in outputs:
-                print(out)
-            cmd_eval._last_output = outputs[0] if outputs else ""
+            xt, memory = sample(denoiser, schedule, batch_size=1, seq_len=seq_len,
+                                num_steps=args.steps, memory=memory, device=device)
+            print(as_text(xt[0]))
+
 
 # ---------------------------------------------------------------------------
 # Argparse
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="SRLM training and evaluation")
+    parser = argparse.ArgumentParser(description="SRLM v2")
     parser.add_argument("--tf32", action="store_true",
-                        help="Set float32 matmul precision to 'high' (use TF32 on Ampere+)")
+                        help="Enable TF32 matmul precision")
     sub = parser.add_subparsers(dest="command", required=True)
 
     # --- train ---
-    p_train = sub.add_parser("train", help="Train the model")
-    p_train.add_argument("checkpoint", help="Checkpoint directory name")
-    p_train.add_argument("--kalevala", type=int, nargs="?", const=0, default=None,
-                         help="Enable Kalevala training (0 or omit count = indefinite)")
-    p_train.add_argument("--wikipedia", type=int, nargs="?", const=0, default=None,
-                         help="Enable Wikipedia training (0 or omit count = one epoch)")
-    p_train.add_argument("--arithmetic", type=int, nargs="?", const=0, default=None,
-                         help="Enable arithmetic N+M=Y training (0 or omit count = indefinite)")
-    p_train.add_argument("--sudoku", type=int, nargs="?", const=0, default=None,
-                         help="Enable sudoku training (0 or omit count = indefinite)")
-    p_train.add_argument("--qa", type=int, nargs="?", const=0, default=None,
-                         help="Enable QA training (0 or omit count = indefinite)")
+    p_train = sub.add_parser("train")
+    p_train.add_argument("checkpoint")
+    # Data programs
+    p_train.add_argument("--kalevala", type=int, nargs="?", const=0, default=None)
+    p_train.add_argument("--wikipedia", type=int, nargs="?", const=0, default=None)
+    p_train.add_argument("--arithmetic", type=int, nargs="?", const=0, default=None)
+    p_train.add_argument("--sudoku", type=int, nargs="?", const=0, default=None)
+    p_train.add_argument("--qa", type=int, nargs="?", const=0, default=None)
     p_train.add_argument("--qa-file", type=str, default="../../data/finnish_qa_663.jsonl",
-                         help="Path to JSONL file with question/answer fields")
-    # Model config presets and overrides
-    p_train.add_argument("--medium", action="store_true",
-                         help="Use medium config (~30M params, d_model=384)")
-    p_train.add_argument("--large", action="store_true",
-                         help="Use large config (~200M params, d_model=1152)")
-    p_train.add_argument("--no-compile", action="store_true", dest="no_compile",
-                         help="Disable torch.compile (workaround for Inductor bugs)")
-    p_train.add_argument("--d-model", type=int, default=None, dest="d_model",
-                         help="Override d_model")
-    p_train.add_argument("--n-priors", type=int, default=None, dest="n_priors",
-                         help="Override number of prior layers")
-    p_train.add_argument("--n-posteriors", type=int, default=None, dest="n_posteriors",
-                         help="Override number of posterior layers")
-    p_train.add_argument("--n-heads", type=int, default=None, dest="n_heads",
-                         help="Override number of attention heads")
-    p_train.add_argument("--dropout", type=float, default=None,
-                         help="Override dropout rate")
-    p_train.add_argument("--N", type=int, default=None,
-                         help="Override HRM N (outer iterations)")
-    p_train.add_argument("--T", type=int, default=None,
-                         help="Override HRM T (inner iterations per slow step)")
-    p_train.add_argument("--save-every", type=int, default=1000,
-                         help="Save checkpoint every N global steps (default: 1000)")
-    p_train.add_argument("--report-every", type=int, default=10,
-                         help="Report loss every N steps (default: 10)")
-    p_train.add_argument("--supervision", type=int, default=8,
-                         help="Supervision steps per training step (default: 8)")
-    p_train.add_argument("--batch-size", type=int, default=32,
-                         help="Batch size (default: 32)")
-    p_train.add_argument("--seq-len", type=int, default=None,
-                         help="Sequence length (default: from config)")
-    p_train.add_argument("--lr", type=float, default=1e-4,
-                         help="Learning rate (default: 1e-4)")
-    p_train.add_argument("--warmup-steps", type=int, default=0, dest="warmup_steps",
-                         help="Linear LR warmup steps (default: off)")
+                         dest="qa_file")
+    # Model config
+    p_train.add_argument("--medium", action="store_true")
+    p_train.add_argument("--large", action="store_true")
+    p_train.add_argument("--hidden-dim", type=int, default=None, dest="hidden_dim")
+    p_train.add_argument("--num-heads", type=int, default=None, dest="num_heads")
+    p_train.add_argument("--seq-len", type=int, default=None, dest="seq_len")
+    # Training
+    p_train.add_argument("--batch-size", type=int, default=32, dest="batch_size")
+    p_train.add_argument("--lr", type=float, default=3e-4)
+    p_train.add_argument("--warmup-steps", type=int, default=100, dest="warmup_steps")
+    p_train.add_argument("--save-every", type=int, default=1000, dest="save_every")
+    p_train.add_argument("--report-every", type=int, default=10, dest="report_every")
+    p_train.add_argument("--sample-every", type=int, default=500, dest="sample_every")
+    # Ponder
+    p_train.add_argument("--supervision", type=int, default=16,
+                         help="Ponder supervision segments (default: 16)")
+    p_train.add_argument("--ponder-every", type=int, default=0, dest="ponder_every",
+                         help="Interleave ponder training every N steps (0=off)")
+    # Memory replay (Anki-style)
     p_train.add_argument("--memory-size", type=int, default=0, dest="memory_size",
-                         help="Rolling memory bank size (0 = disabled, default: 0)")
-    p_train.add_argument("--memory-k", type=int, default=2, dest="memory_k",
-                         help="Number of memories to retrieve per step (default: 2)")
-    p_train.add_argument("--memory-refresh", type=int, default=100, dest="memory_refresh",
-                         help="Re-encode memory bank every N steps (default: 100)")
-    p_train.add_argument("--memory-alternate", type=int, default=0, dest="memory_alternate",
-                         help="Alternate memory on/off every N steps (0 = always on, default: 0)")
+                         help="Replay buffer size (0=off, default: 0)")
+    p_train.add_argument("--memory-alternate", type=int, default=50, dest="memory_alternate",
+                         help="Alternate study/practice every N steps (default: 50)")
+    p_train.add_argument("--memory-refresh", type=int, default=200, dest="memory_refresh",
+                         help="Re-encode replay buffer every N steps (default: 200)")
+    # Program interleaving
     p_train.add_argument("--interleave", type=int, default=0,
-                         help="Switch between programs every N steps (0 = sequential, default: 0)")
-    p_train.add_argument("--grpo-every", type=int, default=0, dest="grpo_every",
-                         help="Run GRPO reinforcement every N steps (0 = disabled, default: 0)")
-    p_train.add_argument("--grpo-k", type=int, default=4, dest="grpo_k",
-                         help="Number of candidates per prompt for GRPO (default: 4)")
-    p_train.add_argument("--grpo-steps", type=int, default=50, dest="grpo_steps",
-                         help="Diffusion sampling steps for GRPO generation (default: 50)")
-    p_train.add_argument("--grpo-epochs", type=int, default=1, dest="grpo_epochs",
-                         help="Optimization epochs per GRPO batch (default: 1)")
-    p_train.add_argument("--lora-rank", type=int, default=0, dest="lora_rank",
-                         help="LoRA rank for GRPO (0 = disabled, trains all params)")
-    p_train.add_argument("--lora-alpha", type=float, default=16.0, dest="lora_alpha",
-                         help="LoRA scaling alpha (default: 16)")
-    p_train.add_argument("--grpo-beta", type=float, default=1.0, dest="grpo_beta",
-                         help="DGPO sigmoid temperature (default: 1.0)")
-    p_train.add_argument("--grpo-act-steps", type=int, default=8, dest="grpo_act_steps",
-                         help="Adaptive computation steps per diffusion step in GRPO (default: 8)")
-    p_train.add_argument("--grpo-fused", action="store_true", dest="grpo_fused",
-                         help="Fused GRPO backward (faster, uses more VRAM)")
-    p_train.add_argument("--print-grpo", action="store_true", dest="print_grpo",
-                         help="Print GRPO prompts, candidates, and rewards")
-    p_train.add_argument("--profile", action="store_true", dest="profile",
-                         help="Profile the training loop")
+                         help="Switch programs every N steps (0=sequential)")
 
     # --- eval ---
-    p_eval = sub.add_parser("eval", help="Interactive evaluation")
-    p_eval.add_argument("checkpoint", help="Checkpoint directory name")
-    p_eval.add_argument("--no-compile", action="store_true", dest="no_compile",
-                         help="Disable torch.compile")
-    p_eval.add_argument("--steps", type=int, default=10,
-                        help="Sampling steps (default: 10)")
-    p_eval.add_argument("--seq-len", type=int, default=None,
-                        help="Sequence length (default: from config)")
-    p_eval.add_argument("--memory-size", type=int, default=0,
-                        help="Memory bank capacity (0 = disabled)")
-    p_eval.add_argument("--memory-k", type=int, default=2,
-                        help="Number of memories to retrieve per query")
-    p_eval.add_argument("--ema", action="store_true",
-                        help="Use EMA weights for eval (only useful after long training)")
-    p_eval.add_argument("--act-steps", type=int, default=8,
-                        help="Max adaptive computation steps per diffusion step (default: 8)")
+    p_eval = sub.add_parser("eval")
+    p_eval.add_argument("checkpoint")
+    p_eval.add_argument("--steps", type=int, default=64)
+    p_eval.add_argument("--seq-len", type=int, default=None, dest="seq_len")
+    p_eval.add_argument("--ema", action="store_true")
 
     args = parser.parse_args()
     if args.tf32:
         torch.set_float32_matmul_precision('high')
-        print("TF32 matmul precision enabled")
+        print("TF32 enabled")
     if args.command == "train":
-        if args.profile:
-            with profile(activities=[ProfilerActivity.CPU], record_shapes=True) as prof:
-                with record_function("training"):
-                    cmd_train(args)
-            print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=100))
-        else:
-            cmd_train(args)
+        cmd_train(args)
     elif args.command == "eval":
         cmd_eval(args)
+
 
 if __name__ == "__main__":
     main()

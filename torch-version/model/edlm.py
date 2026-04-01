@@ -28,7 +28,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from ema import EMA
+from .ema import EMA
 
 directory = Path(__file__).parent
 
@@ -237,8 +237,7 @@ class DenoisingTransformer(nn.Module):
         """Logits (B, L, n_vocab) for x₀ prediction."""
         return self.out_proj(self.get_hidden(xt, t))
 
-
-class EnergyModel(nn.Module):
+class EnergyModelBase(nn.Module):
     """
     Residual energy function  E_φ(x₀, x_t, t)  — Eq (7).
 
@@ -251,9 +250,8 @@ class EnergyModel(nn.Module):
     Low energy  → coherent / realistic x₀ proposal.
     High energy → incoherent / unlikely x₀ proposal.
     """
-    def __init__(self, mk_denoiser, n_vocab, dim=256):
+    def __init__(self, dim):
         super().__init__()
-        self.backbone = mk_denoiser()
         self.energy_head = nn.Sequential(
             nn.Linear(dim, dim),
             nn.GELU(),
@@ -262,11 +260,21 @@ class EnergyModel(nn.Module):
         nn.init.zeros_(self.energy_head[-1].weight)
         nn.init.zeros_(self.energy_head[-1].bias)
 
+    def outlet(self, h):
+        pooled = h.mean(dim=1)                        # (B, dim)
+        return self.energy_head(pooled).squeeze(-1)   # (B,)
+
+
+class EnergyModel(EnergyModelBase):
+    def __init__(self, mk_denoiser, dim=256):
+        super().__init__(dim)
+        self.backbone = mk_denoiser()
+
     def init_from_denoiser(self, denoiser):
         """Copy pretrained MDLM weights into the backbone."""
         self.backbone.load_state_dict(denoiser.state_dict())
 
-    def forward(self, x0, xt, t):
+    def forward(self, x0, t):
         """
         E_φ(x₀, x_t, t) → (B,) scalar energies.
 
@@ -275,8 +283,7 @@ class EnergyModel(nn.Module):
         implicitly has access to x_t through x₀ itself.
         """
         h = self.backbone.get_hidden(x0, t)          # (B, L, dim)
-        pooled = h.mean(dim=1)                        # (B, dim)
-        return self.energy_head(pooled).squeeze(-1)   # (B,)
+        return self.outlet(h)
 
 
 # ============================================================
@@ -326,7 +333,7 @@ class MDLMLoss:
             return torch.tensor(0.0, device=device, requires_grad=True)
 
         ce = F.cross_entropy(
-            logits.transpose(1, 2), x0, reduction='none')  # (B, L)
+            logits.transpose(1, 2), x0.long(), reduction='none')  # (B, L)
         return (ce * is_masked.float()).sum() / n_masked
 
     @classmethod
@@ -403,8 +410,8 @@ def nce_loss(energy_model, denoiser, x0, schedule,
 
     # ---- energies ----
     loss = nce_loss(
-        e_pos = energy_model(x_pos, xt, t),                    # (B,)
-        e_neg = energy_model(x_neg, xt, t))                    # (B,)
+        e_pos = energy_model(x_pos, t),                    # (B,)
+        e_neg = energy_model(x_neg, t))                    # (B,)
     return loss
 
 # ============================================================
@@ -424,16 +431,13 @@ class Sampler:
     mask_id : int
     n_vocab : int
 
-    def __call__(self, batch_size, seq_len, device,
-             num_steps=256,
-             energy_model=None, k=8, window_w=0.2):
+    def __call__(self, batch_size, seq_len, device, num_steps=256):
         # τ₁ > τ₂ > … > τ_N  (from ≈1 to 0)
         taus = torch.linspace(1.0, 0.0, num_steps + 1, device=device)
         # x_{τ₁} ← m  (fully masked)
         xt = torch.full((batch_size, seq_len), self.mask_id,
                         dtype=torch.long, device=device)
         return xt, SamplingStepper(self, taus, batch_size, seq_len, num_steps,
-                                   energy_model, k, window_w,
                                    device)
 
 @dataclass
@@ -443,9 +447,6 @@ class SamplingStepper:
     batch_size : int
     seq_len    : int
     num_steps  : int
-    energy_model : Any
-    k          : int
-    window_w   : float
     device     : torch.device
 
     def __iter__(self):
@@ -463,76 +464,98 @@ class SamplingStep:
     tau_next : float
     t        : torch.Tensor
 
-    def sample(self, xt, logits):
-        stepper      = self.stepper
-        n            = stepper.sampler.n_vocab
-        mask_id      = stepper.sampler.mask_id
-        batch_size   = stepper.batch_size
-        seq_len      = stepper.seq_len
-        device       = stepper.device
-        energy_model = stepper.energy_model
-        k            = stepper.k
-        window_w     = stepper.window_w
+    def propose_x0(self, xt, logits):
+        """Sample a single x₀ candidate from denoiser logits.
 
-        probs = F.softmax(logits, dim=-1)                  # (B, L, n)
-        is_masked = (xt == mask_id)                         # (B, L)
+        Fills masked positions with samples from softmax(logits),
+        keeps unmasked positions unchanged.
 
-        use_is = (energy_model is not None and self.tau_n >= 1.0 - window_w)
+        Returns:
+            x0: (B, L) proposed clean tokens
+        """
+        mask_id = self.stepper.sampler.mask_id
+        n = self.stepper.sampler.n_vocab
+        B, L = xt.shape
+        probs = F.softmax(logits, dim=-1)
+        s = torch.multinomial(probs.reshape(-1, n), 1).reshape(B, L)
+        x0 = xt.clone()
+        x0[xt == mask_id] = s[xt == mask_id]
+        return x0
 
-        if use_is:
-            # ---- importance sampling (lines 5–8) ----
-            flat_probs = probs.reshape(-1, n)
+    def propose_x0_k(self, xt, logits, k):
+        """Sample k x₀ candidates from denoiser logits.
 
-            # draw k candidate x₀'s
-            candidates = []
-            for _ in range(k):
-                s = torch.multinomial(flat_probs, 1).reshape(
-                    batch_size, seq_len)
-                cand = xt.clone()
-                cand[is_masked] = s[is_masked]
-                candidates.append(cand)
+        Returns:
+            candidates: (k, B, L) proposed clean tokens
+        """
+        mask_id = self.stepper.sampler.mask_id
+        n = self.stepper.sampler.n_vocab
+        B, L = xt.shape
+        probs = F.softmax(logits, dim=-1)
+        flat_probs = probs.reshape(-1, n)
+        is_masked = (xt == mask_id)
+        candidates = []
+        for _ in range(k):
+            s = torch.multinomial(flat_probs, 1).reshape(B, L)
+            cand = xt.clone()
+            cand[is_masked] = s[is_masked]
+            candidates.append(cand)
+        return torch.stack(candidates, dim=0)
 
-            # batch energy computation  (k·B forward passes → 1)
-            all_cands = torch.stack(candidates, dim=0)     # (k, B, L)
-            c_flat = all_cands.reshape(k * batch_size, seq_len)
-            xt_flat = xt.unsqueeze(0).expand(k, -1, -1).reshape(k * batch_size, seq_len)
-            t_flat = self.t.unsqueeze(0).expand(k, -1).reshape(k * batch_size)
+    @staticmethod
+    def select_by_energy(candidates, energies):
+        """Resample one x₀ per batch element, weighted by exp(-E).
 
-            energies = energy_model(
-                c_flat, xt_flat, t_flat).reshape(k, batch_size)
+        Args:
+            candidates: (k, B, L)
+            energies:   (k, B) scalar energies per candidate
 
-            # resample proportional to exp(−E)
-            weights = F.softmax(-energies, dim=0)          # (k, B)
-            idx = torch.multinomial(weights.t(), 1).squeeze(-1)  # (B,)
-            x0_sampled = all_cands[
-                idx, torch.arange(batch_size, device=device)]
+        Returns:
+            x0: (B, L) selected candidates
+        """
+        k, B = energies.shape
+        device = energies.device
+        weights = F.softmax(-energies, dim=0)            # (k, B)
+        idx = torch.multinomial(weights.t(), 1).squeeze(-1)  # (B,)
+        return candidates[idx, torch.arange(B, device=device)]
 
-        else:
-            # ---- regular sampling (line 10) ----
-            s = torch.multinomial(
-                probs.reshape(-1, n), 1).reshape(batch_size, seq_len)
-            x0_sampled = xt.clone()
-            x0_sampled[is_masked] = s[is_masked]
+    def reverse_step(self, xt, x0):
+        """Reverse diffusion step: q(x_{τ_{n+1}} | x_{τ_n}, x₀) — Eq (4).
 
-        # ---- reverse step  q(x_{τ_{n+1}} | x_{τ_n}, x₀) — Eq (4) ----
+        Unmasks a fraction of masked positions, replacing them with
+        values from x0. At the last step (tau_next=0), accepts x0 fully.
+
+        Args:
+            xt: (B, L) current noised tokens
+            x0: (B, L) proposed clean tokens
+
+        Returns:
+            xt_new: (B, L) less-noised tokens
+        """
+        stepper = self.stepper
+        mask_id = stepper.sampler.mask_id
+        device = stepper.device
+        B, L = xt.shape
+        is_masked = (xt == mask_id)
+
         if self.tau_next > 0:
-            # TODO: keep tau_n and tau_next in tensors.
-            alpha_t = stepper.sampler.schedule.alpha(torch.tensor(self.tau_n, device=device))
-            alpha_s = stepper.sampler.schedule.alpha(torch.tensor(self.tau_next, device=device))
-
-            # probability of unmasking a currently-masked position
+            alpha_t = stepper.sampler.schedule.alpha(
+                torch.tensor(self.tau_n, device=device))
+            alpha_s = stepper.sampler.schedule.alpha(
+                torch.tensor(self.tau_next, device=device))
             p_unmask = ((alpha_s - alpha_t)
                         / (1.0 - alpha_t)).clamp(0, 1)
-            unmask = torch.rand(
-                batch_size, seq_len, device=device) < p_unmask
-
+            unmask = torch.rand(B, L, device=device) < p_unmask
             xt_new = xt.clone()
-            xt_new[is_masked & unmask] = x0_sampled[is_masked & unmask]
-            xt = xt_new
+            xt_new[is_masked & unmask] = x0[is_masked & unmask]
+            return xt_new
         else:
-            # last step: accept full x₀
-            xt = x0_sampled
-        return xt
+            return x0
+
+    def sample(self, xt, logits):
+        """Convenience: propose_x0 + reverse_step in one call."""
+        return self.reverse_step(xt, self.propose_x0(xt, logits))
+
 
 @torch.no_grad()
 def sample(
@@ -547,6 +570,8 @@ def sample(
     device=torch.device("cpu"),
 ):
     """
+    Algorithm 1: Denoising via Importance Sampling.
+
     Args:
         denoiser:     MDLM denoiser p_θ
         schedule:     noise schedule
@@ -561,25 +586,23 @@ def sample(
         (batch_size, seq_len) generated token ids
     """
     sampler = Sampler(schedule, denoiser.mask_id, denoiser.n_vocab)
-    xt, stepper = sampler(batch_size, seq_len, device, num_steps,
-                               energy_model=energy_model, k=k, window_w=window_w)
-    # project to xt here
+    xt, stepper = sampler(batch_size, seq_len, device, num_steps)
 
     for s in stepper:
-        # ---- denoiser prediction μ_θ(x̄_{τ_n}) ----
         logits = denoiser(xt, s.t)
-        xt = s.sample(xt, logits)
+
+        if energy_model is not None and s.tau_n >= 1.0 - window_w:
+            candidates = s.propose_x0_k(xt, logits, k)       # (k, B, L)
+            c_flat = candidates.reshape(k * batch_size, seq_len)
+            t_flat = s.t.unsqueeze(0).expand(k, -1).reshape(k * batch_size)
+            energies = energy_model(c_flat, t_flat).reshape(k, batch_size)
+            x0 = s.select_by_energy(candidates, energies)
+        else:
+            x0 = s.propose_x0(xt, logits)
+
+        xt = s.reverse_step(xt, x0)
     return xt
 
-
-# ============================================================
-# Conditional Sampling  (infilling / prompting)
-# ============================================================
-# In masked diffusion, conditional sampling is natural:
-# prompt positions start unmasked and the carry-over property
-# (Eq 4: x_t ≠ m ⟹ x_s = x_t) guarantees they stay fixed.
-# No special projection or clamping is needed — only free
-# positions are ever MASK, so only they get generated.
 
 # ============================================================
 # Perplexity / NLL Evaluation  (Section 4.3, Eq 12–14)
@@ -623,7 +646,7 @@ def estimate_nll(
               * is_masked.float()).sum(-1)                  # (B,)
 
         if energy_model is not None:
-            e_x0 = energy_model(x0, xt, t_batch)
+            e_x0 = energy_model(x0, t_batch)
 
             # estimate log Z_φ via samples from p_θ
             probs = F.softmax(logits, dim=-1)
@@ -633,7 +656,7 @@ def estimate_nll(
                     probs.reshape(-1, n), 1).reshape(B, L)
                 xs = x0.clone()
                 xs[is_masked] = s[is_masked]
-                es.append(energy_model(xs, xt, t_batch))
+                es.append(energy_model(xs, t_batch))
             e_stack = torch.stack(es, dim=0)               # (nz, B)
             log_z = (torch.logsumexp(-e_stack, dim=0)
                      - math.log(num_z_samples))
@@ -750,7 +773,7 @@ if __name__ == "__main__":
     energy = EnergyModel(
         (lambda: DenoisingTransformer(
             n_vocab, seq_len, dim, num_heads, num_layers)),
-        n_vocab, dim).to(device)
+        dim=dim).to(device)
     energy.init_from_denoiser(denoiser)
     print(f"Energy model params: "
           f"{sum(p.numel() for p in energy.parameters()):,}")

@@ -18,6 +18,15 @@ import torch.nn.functional as F
 from dataclasses import dataclass, field
 from typing import Optional, Literal, Callable, Any, Tuple
 from .attnres import BlockDivider, BlockAttnResOp
+from .edlm import (
+        MDLMLoss, NCELoss, mask_tokens, Sampler, SamplingStep,
+        LogLinearSchedule, EnergyModelBase,
+)
+from .gmem import LatentMemoryBank, MemoryLoss
+from .cmm import (
+    PonderBlock, equilibrium_loss, routh_hurwitz_stable_loss,
+    routh_hurwitz_unstable_loss, repulsion_loss,
+)
 
 @dataclass
 class GMemConfig:
@@ -29,630 +38,507 @@ class PonderConfig:
     N_H:                   int = 3
     N_L:                   int = 6
     noise_sigma:           float = 0.01
+    noise_type:            str = "additive"
+    use_stablemax:         str = "3"
+    use_attention:         bool = True
 
 @dataclass
 class SRLMConfig:
-    vocab_size:            int
-    max_context_length:    int
-    hidden_dim:            int
+    gmem:                  GMemConfig
+    ponder:                PonderConfig
+    vocab_size:            int = 256
+    max_context_length:    int = 128
+    hidden_dim:            int = 256
     num_heads:             int = 8
-    front_layers:          int
-    mid_layers:            list[PonderConfig | GMemConfig]
-    back_layers:           int
+    mlp_ratio:             int = 4
+    front_layers:          int = 2
+    back_layers:           int = 2
     dropout:               float = 0.2
-    block_size:            int = 1 # Full AttnRes at this point.
 
+class SRLMEnergyModel(EnergyModelBase):
+    def __init__(self, cfg):
+        super().__init__(cfg.hidden_dim)
+        self.denoiser = SRLMDenoiser(cfg)
 
+    def init_from_denoiser(self, denoiser):
+        self.denoiser.load_state_dict(denoiser.state_dict())
 
+    def forward(self, x0, t, memory=None):
+        h, memory, importance_scores = self.denoiser.get_hidden(x0, t, memory)
+        return self.outlet(h), memory, importance_scores
 
-class SRLM(nn.Module):
+class SRLMDenoiser(nn.Module):
     def __init__(self, cfg: SRLMConfig):
         super().__init__()
         self.cfg = cfg
-        self.input = InputLayer()
+        self.input = InputLayer(cfg.vocab_size,
+                                cfg.hidden_dim,
+                                cfg.num_heads,
+                                cfg.max_context_length)
         self.front_layers = nn.ModuleList([
             init_layer(cfg)
             for _ in range(cfg.front_layers)
         ])
-        self.mid_layers = nn.ModuleList([
-            init_middle_layer(cfg, which)
-            for which in cfg.mid_layers
-        ])
+        self.latent_memory = LatentMemoryBank(
+                    cfg.hidden_dim,
+                    cfg.gmem.memory_dim,
+                    cfg.gmem.num_slots,
+                    cfg.num_heads)
+        self.ponder = Ponder(cfg)
         self.back_layers = nn.ModuleList([
             init_layer(cfg)
             for _ in range(cfg.back_layers)
         ])
-        self.out_proj = nn.Linear()
+        self.out_proj = nn.Linear(cfg.hidden_dim, cfg.vocab_size)
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.constant_(self.out_proj.bias, -6.0)
 
-    def forward(self, x):
-        return x
+    def decide(self, xt, t, memory=None):
+        h, c, cos, sin, memory, importance_scores = self.get_front(xt, t, memory)
+        q = self.ponder.decide(h)
+        return q, h, c, cos, sin, memory, importance_scores
 
-#    @torch.no_grad()
-#    def encode_document(self, tokens: torch.Tensor) -> torch.Tensor:
-#        """Encode a document into a compressed memory block.
-#
-#        Runs tokens through input + prior layers (at sigma=0, i.e. clean text),
-#        then pools to a fixed-size representation that matches (B, L, D) shape
-#        for compatibility with the block list.
-#
-#        Args:
-#            tokens: (B, L_doc) int tensor — document token IDs.
-#                    Long documents are split into context_length chunks,
-#                    encoded separately, and averaged.
-#        Returns:
-#            memory: (B, L, D) — compressed document representation,
-#                    where L = cfg.context_length
-#        """
-#        B = tokens.shape[0]
-#        L = self.cfg.context_length
-#        L_doc = tokens.shape[1]
-#        sigma = torch.zeros(B, device=tokens.device)
-#
-#        if L_doc <= L:
-#            if L_doc < L:
-#                tokens = F.pad(tokens, (0, L - L_doc), value=0)
-#            h, _, _, _, _ = self._encode_prior(tokens, sigma)
-#            return h
-#
-#        # Long doc: split into chunks, encode each, average
-#        chunks = [tokens[:, i:i+L] for i in range(0, L_doc, L)]
-#        if chunks[-1].shape[1] < L:
-#            chunks[-1] = F.pad(chunks[-1], (0, L - chunks[-1].shape[1]), value=0)
-#        encoded = []
-#        for chunk in chunks:
-#            h, _, _, _, _ = self._encode_prior(chunk, sigma)
-#            encoded.append(h)
-#        return torch.stack(encoded).mean(dim=0)  # (B, L, D)
-#
-#    def _encode_prior(self, tokens, sigma, memories=None):
-#        """Run input + prior layers, return aggregated output via mid_res."""
-#        q, cos, sin, t = self.input(tokens, sigma)
-#        bd = BlockDivider.top(q, block_size=1)
-#        #if memories is not None:
-#        #    blocks.extend(memories)
-#        for layer in self.prior:
-#            bd = layer(bd, cos, sin, t)
-#        h = self.mid_res(bd)
-#        bd = bd.div(force=True)
-#        return h, bd, cos, sin, t
-#
-#    def front(self, x, sigma, memories=None):
-#        """Encode input through prior layers with optional memory context.
-#
-#        Memories are injected into the block list so prior layers and HRM
-#        both have access to stored context.
-#        """
-#        h, bd, cos, sin, t = self._encode_prior(x, sigma, memories)
-#        return h, bd, cos, sin, t, sigma
-#
-#    def recur(self, st, ix):
-#        """Run just HRM + Q_head. Cheap — call this in adaptive loops.
-#
-#        Returns:
-#            st: new HRM state (detached)
-#            y: HRM output (B, L, D)
-#            q: (B, 1) halting signal
-#        """
-#        h, bd, cos, sin, t, sigma = ix
-#        st, y = self.main(st, h, cos, sin, t)
-#        q = self.Q_head(y.mean(dim=1)) # TODO: um... explain? why 'mean' there?
-#        return st, y, q
-#
-#    def head(self, y, ix):
-#        """Run posterior layers + output. Expensive — call once after recur() loop.
-#
-#        Returns:
-#            log_score: (B, L, V) output logits
-#            aux_loss: scalar (always 0 now — routing removed)
-#        """
-#        _, bd, cos, sin, t, sigma = ix
-#        bd = bd(y)
-#
-#        for layer in self.posterior:
-#            bd = layer(bd, cos, sin, t)
-#
-#        h = self.final_res(bd)
-#        return self.output(h, t, sigma), torch.zeros((), device=h.device)
-#
-#    def step(self, st, ix):
-#        """Convenience: recur() + head() in one call.
-#
-#        Returns:
-#            st: new HRM state (detached)
-#            log_score: (B, L, V) output logits
-#            q: (B, 1) halting signal
-#            aux_loss: routing entropy loss
-#        """
-#        st, y, q = self.recur(st, ix)
-#        log_score, aux_loss = self.head(y, ix)
-#        return st, log_score, q, aux_loss
-#
-#    def short(self, x, sigma_bar):
-#        h, bd, cos, sin, t = self._encode_prior(x, sigma_bar)
-#        y = torch.zeros_like(h)
-#        log_score, _ = self.head(y, (h, bd, cos, sin, t, sigma_bar))
-#        return log_score
-#
-#
-#    def sideways(self, st, x, sigma_bar):
-#        ix = self.front(x, sigma_bar, memories=None)
-#        st, log_score, q, aux_loss = self.step(st, ix)
-#        return st, log_score
-#
-#    def forward(self, x, sigma_bar):
-#        """Standard API: front() + step() in one call.
-#
-#        Args:
-#            z: HRM state tuple (y, z)
-#            x: (B, L) input token IDs
-#            sigma: (B,) noise level
-#            memories: optional list of memory tensors
-#        Returns:
-#            z: new HRM state
-#            log_score: (B, L, V) output logits
-#            aux_loss: scalar auxiliary loss
-#        """
-#        z = make_z(x.shape[0], x.shape[1], self.cfg.d_model, device=x.device)
-#        ix = self.front(x, sigma_bar, memories=None)
-#        st, log_score, q, aux_loss = self.step(z, ix)
-#        return log_score
-#
-#class HRM(nn.Module):
-#    """Hierarchical Recurrent Memory — v2 (TRM-inspired).
-#
-#    Uses a single shared DiTBlock for both fast and slow recursion roles,
-#    following TRM's finding that one network generalizes better than two.
-#
-#    Fast step:  zL = block(zL + zH + x, p, t)   — refine with input
-#    Slow step:  zH = block(zH + zL, p, t)        — consolidate
-#
-#    All iterations except the final cycle run under no_grad.
-#    """
-#    def __init__(self, cfg: SRLMConfig):
-#        super().__init__()
-#        self.N = cfg.N
-#        self.T = cfg.T
-#        self.block = DiTBlock(cfg.d_model, cfg.d_model, num_heads=cfg.n_heads,
-#                              mlp_ratio=4.0, dropout=cfg.dropout)
-#        self.norm_y = AdaLN(cfg.d_model)
-#        self.norm_z = AdaLN(cfg.d_model)
-#
-#    def latent_recursion(self, x, y, z, cos, sin, t, n):
-#        for i in range(n):
-#            z = self.block(x + y + z, cos, sin, t)
-#        y = self.block(y + z, cos, sin, t)
-#        return y, z
-#
-#    def forward(self, st, x, cos, sin, t):
-#        y, z = self.norm_y(st[0], t), self.norm_z(st[1], t)
-#
-#        with torch.no_grad():
-#            for j in range(self.T - 1):
-#                y, z = self.latent_recursion(x, y, z, cos, sin, t, self.N)
-#        y, z = self.latent_recursion(x, y, z, cos, sin, t, self.N)
-#        return (y.detach(), z.detach()), y
-#
-#def _sinusoidal_pos_emb(length: int, dim: int) -> torch.Tensor:
-#    half = dim // 2
-#    freqs = torch.exp(-math.log(10000) * torch.arange(half, dtype=torch.float32) / half)
-#    pos   = torch.arange(length, dtype=torch.float32)
-#    args  = pos[:, None] * freqs[None]
-#    return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)  # (length, dim)
-#
-#
-#class InputLayer(nn.Module):
-#    def __init__(self, cfg: SRLMConfig):
-#        super().__init__()
-#        self.input_emb    = nn.Embedding(cfg.vocab_size, cfg.d_model)
-#        self.timestep_emb = TimestepEmbedder(cfg.d_model, cfg.d_frequency_embedding)
-#        # Fixed sinusoidal position encoding — not learnable so it can't collapse
-#        # when training on position-agnostic data (all positions same target token).
-#        #self.pos_emb    = nn.Embedding(cfg.context_length, cfg.d_model)
-#        #self.register_buffer("pos_emb", _sinusoidal_pos_emb(cfg.context_length, cfg.d_model))
-#        # Precompute rotary frequencies
-#        head_dim = cfg.d_model // cfg.n_heads
-#        half = head_dim // 2
-#        freqs = 1.0 / (10000.0 ** (torch.arange(half).float() / half))
-#        pos = torch.arange(cfg.context_length).float()
-#        angles = pos[:, None] * freqs[None, :]
-#        self.register_buffer("rot_cos", torch.cos(angles), persistent=False)
-#        self.register_buffer("rot_sin", torch.sin(angles), persistent=False)
-#
-#
-#    def forward(self, x: torch.Tensor, sigma: torch.Tensor):
-#        L = x.shape[-1]
-#        y = self.input_emb(x)                              # (B, L, D)
-#        sigma_emb = self.timestep_emb(sigma)       # (B, D)
-#        #y += self.pos_emb[:x.shape[1]]                      # (L, D), fixed
-#        cos = self.rot_cos[:L][None, None, :, :]                  # (1,1,L,half)
-#        sin = self.rot_sin[:L][None, None, :, :]
-#        return y, cos, sin, sigma_emb
-#
-#def _apply_rotary(x, cos, sin):
-#    """Apply rotary embedding to x: (B, H, L, D)."""
-#    d = x.shape[-1] // 2
-#    x1, x2 = x[..., :d], x[..., d:]
-#    return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
-#
-#
-#class OutputLayer(nn.Module):
-#    def __init__(self, cfg: SRLMConfig):
-#        super().__init__()
-#        self.outlet = cfg.outlet
-#        self.norm = nn.LayerNorm(cfg.d_model)
-#        self.proj = nn.Linear(cfg.d_model, cfg.vocab_size)
-#        nn.init.zeros_(self.proj.weight)
-#        nn.init.constant_(self.proj.bias, -6.0)
-#
-#    def forward(self, y: torch.Tensor, t: torch.Tensor, sigma_bar: torch.Tensor) -> torch.Tensor:
-#        y = self.norm(y)
-#        y = self.proj(y)
-#        return self.outlet(y, sigma_bar)
-#
-#class FeedForward(nn.Module):
-#    def __init__(self, dim: int):
-#        super().__init__()
-#        self.pre = nn.Linear(dim, 4 * dim)
-#        # zero init on output projection — starts as identity passthrough
-#        self.pos = nn.Linear(4 * dim, dim)
-#        nn.init.zeros_(self.pos.weight)
-#        nn.init.zeros_(self.pos.bias)
-#
-#    def forward(self, x: torch.Tensor) -> torch.Tensor:
-#        return self.pos(F.gelu(self.pre(x)))
-#
-#
-#class AdaLN(nn.Module):
-#    def __init__(self, d_model: int):
-#        super().__init__()
-#        self.norm = nn.LayerNorm(d_model, elementwise_affine=False)
-#        self.proj = nn.Linear(d_model, 2 * d_model)
-#
-#    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-#        # x: (B, L, D), cond: (B, D)
-#        scale, shift = self.proj(cond).chunk(2, dim=-1)  # each (B, D)
-#        return self.norm(x) * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
-#
-#class AttnResDiTBlock(nn.Module):
-#    """
-#    A AttnRes DiT block with adaLN-Zero modulation.
-#    """
-#    def __init__(self, hidden_dim: int, embedding_dim: int, num_heads: int, mlp_ratio: float = 4.0, dropout: float = 0.1):
-#        super().__init__()
-#        self.attn_res = BlockAttnResOp(hidden_dim)
-#        self.mlp_res = BlockAttnResOp(hidden_dim)
-#
-#        # Normalization layers (using LayerNorm without elementwise affine,
-#        # as adaLN provides the affine parameters)
-#        self.norm1 = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
-#        self.norm2 = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
-#
-#        # Modulation network to generate adaLN parameters
-#        self.modulation = AdaLNModulation(embedding_dim, hidden_dim)
-#        self.attn = SelfAttention(hidden_dim, num_heads)
-#
-#        # MLP layer
-#        mlp_hidden_dim = int(hidden_dim * mlp_ratio)
-#        self.mlp = nn.Sequential(
-#            nn.Linear(hidden_dim, mlp_hidden_dim, bias=True),
-#            nn.GELU(approximate="tanh"),
-#            nn.Linear(mlp_hidden_dim, hidden_dim, bias=True),
-#        )
-#
-#        self.drop_attn = nn.Dropout(dropout)
-#        self.drop_mlp  = nn.Dropout(dropout)
-#
-#    def forward(self, bd, cos, sin, c):
-#        # x shape: [batch_size, num_patches, hidden_dim]
-#        # c shape: [batch_size, embedding_dim]
-#
-#        # Calculate modulation parameters (shift, scale, gate for MSA and MLP)
-#        # Each param shape: [batch_size, 1, hidden_dim] after unsqueeze
-#        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = [
-#            m.unsqueeze(1) for m in self.modulation(c)
-#        ]
-#
-#        h = self.attn_res(bd)
-#        bd = bd.div()
-#        # --- Apply adaLN-Zero before MHSA ---
-#        h_norm1 = self.norm1(h)
-#        # Modulate: Scale, Shift
-#        h_modulated1 = h_norm1 * (1 + scale_msa) + shift_msa
-#        # Apply attention
-#        attn_output = self.attn(h_modulated1, cos, sin)
-#
-#        # Apply gating, dropout, and add residual connection
-#        bd = bd(gate_msa * self.drop_attn(attn_output))
-#
-#        h = self.mlp_res(bd)
-#        bd = bd.div()
-#        # --- Apply adaLN-Zero before MLP ---
-#        h_norm2 = self.norm2(h)
-#        # Modulate: Scale, Shift
-#        h_modulated2 = h_norm2 * (1 + scale_mlp) + shift_mlp
-#        # Apply MLP
-#        mlp_output = self.mlp(h_modulated2)
-#        # Apply gating, dropout, and add residual connection
-#        bd = bd(gate_mlp * self.drop_mlp(mlp_output))
-#
-#        # Output shape: [batch_size, num_patches, hidden_dim]
-#        return bd
-#
-#class DiTBlock(nn.Module):
-#    """
-#    A standard DiT block with adaLN-Zero modulation.
-#    """
-#    def __init__(self, hidden_dim: int, embedding_dim: int, num_heads: int, mlp_ratio: float = 4.0, dropout: float = 0.1):
-#        super().__init__()
-#        self.attn = SelfAttention(hidden_dim, num_heads)
-#
-#        # Normalization layers (using LayerNorm without elementwise affine,
-#        # as adaLN provides the affine parameters)
-#        self.norm1 = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
-#        self.norm2 = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
-#
-#        # Modulation network to generate adaLN parameters
-#        self.modulation = AdaLNModulation(embedding_dim, hidden_dim)
-#        # MLP layer
-#        mlp_hidden_dim = int(hidden_dim * mlp_ratio)
-#        self.mlp = nn.Sequential(
-#            nn.Linear(hidden_dim, mlp_hidden_dim, bias=True),
-#            nn.GELU(),#approximate="tanh"),
-#            nn.Linear(mlp_hidden_dim, hidden_dim, bias=True),
-#        )
-#
-#        self.drop_attn = nn.Dropout(dropout)
-#        self.drop_mlp  = nn.Dropout(dropout)
-#
-#    def forward(self, x, cos, sin, c):
-#        # x shape: [batch_size, num_patches, hidden_dim]
-#        # c shape: [batch_size, embedding_dim]
-#
-#        # Calculate modulation parameters (shift, scale, gate for MSA and MLP)
-#        # Each param shape: [batch_size, 1, hidden_dim] after unsqueeze
-#        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = [
-#            m.unsqueeze(1) for m in self.modulation(c)
-#        ]
-#
-#        # --- Apply adaLN-Zero before MHSA ---
-#        x_norm1 = self.norm1(x)
-#        # Modulate: Scale, Shift
-#        x_modulated1 = x_norm1 * (1 + scale_msa) + shift_msa
-#        # Apply attention
-#        attn_output = self.attn(x_modulated1, cos, sin)
-#        # Apply gating, dropout, and add residual connection
-#        x = x + gate_msa * self.drop_attn(attn_output)
-#
-#        # --- Apply adaLN-Zero before MLP ---
-#        x_norm2 = self.norm2(x)
-#        # Modulate: Scale, Shift
-#        x_modulated2 = x_norm2 * (1 + scale_mlp) + shift_mlp
-#        # Apply MLP
-#        mlp_output = self.mlp(x_modulated2)
-#        # Apply gating, dropout, and add residual connection
-#        x = x + gate_mlp * self.drop_mlp(mlp_output)
-#
-#        # Output shape: [batch_size, num_patches, hidden_dim]
-#        return x
-#
-#class SelfAttention(nn.Module):
-#    def __init__(self, dim, num_heads):
-#        super().__init__()
-#        self.num_heads = num_heads
-#        self.head_dim = dim // num_heads
-#        self.qkv = nn.Linear(dim, 3 * dim, bias=False)
-#        self.out_proj = nn.Linear(dim, dim)
-#
-#    def forward(self, x, cos, sin):
-#        B,L,H = x.shape
-#        #q, k, v = self.qkv(x_modulated1).chunk(3, dim=-1)
-#        #q = q.view(B, L, self.num_heads, H // self.num_heads).transpose(1, 2)
-#        #k = k.view(B, L, self.num_heads, H // self.num_heads).transpose(1, 2)
-#        #v = v.view(B, L, self.num_heads, H // self.num_heads).transpose(1, 2)
-#        #q = _apply_rotary(q, cos, sin)
-#        #k = _apply_rotary(k, cos, sin)
-#        #attn_output = F.scaled_dot_product_attention(q, k, v)
-#        #attn_output = attn_output.transpose(1, 2).contiguous().view(B, L, H)
-#        #attn_output = self.out_proj(attn_output)
-#
-#        B, L, _ = x.shape
-#        qkv = self.qkv(x).reshape(B, L, 3, self.num_heads, self.head_dim)
-#        q, k, v = qkv.permute(2, 0, 3, 1, 4)          # 3 × (B,H,L,D)
-#        q = _apply_rotary(q, cos, sin)
-#        k = _apply_rotary(k, cos, sin)
-#        out = F.scaled_dot_product_attention(q, k, v)   # (B,H,L,D)
-#        out = out.transpose(1, 2).reshape(B, L, -1)
-#        return self.out_proj(out)
-#
-#class AdaLNModulation(nn.Module):
-#    """
-#    Calculates shift, scale, and gate parameters from conditioning embeddings.
-#    Initializes the final linear layer's weights and biases to zero.
-#    """
-#    def __init__(self, embedding_dim: int, hidden_dim: int):
-#        super().__init__()
-#        self.silu = nn.SiLU()
-#        # Initialize the linear layer with zeros for the "Zero" aspect
-#        self.linear = nn.Linear(embedding_dim, 6 * hidden_dim, bias=True)
-#        nn.init.zeros_(self.linear.weight)
-#        nn.init.zeros_(self.linear.bias)
-#
-#    def forward(self, c):
-#        # c shape: [batch_size, embedding_dim]
-#        mod_params = self.linear(self.silu(c))
-#        # mod_params shape: [batch_size, 6 * hidden_dim]
-#        # Split into 6 parts for shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp
-#        # Each part has shape [batch_size, hidden_dim]
-#        # Add unsqueeze(1) to make them broadcastable with token dim: [batch_size, 1, hidden_dim]
-#        return mod_params.chunk(6, dim=1)
-#
-#class TimestepEmbedder(nn.Module):
-#    def __init__(self, hidden_size: int, frequency_embedding_size: int = 256):
-#        super().__init__()
-#        self.frequency_embedding_size = frequency_embedding_size
-#        self.pre = nn.Linear(frequency_embedding_size, hidden_size)
-#        self.pos = nn.Linear(hidden_size, hidden_size)
-#
-#    def forward(self, t: torch.Tensor) -> torch.Tensor:
-#        t_freq = timestep_embedding(t, self.frequency_embedding_size)
-#        return self.pos(F.silu(self.pre(t_freq)))
-#
-#
-#def timestep_embedding(t: torch.Tensor, dim: int, max_period: int = 10000) -> torch.Tensor:
-#    half = dim // 2
-#    freqs = torch.exp(
-#        -math.log(max_period) *
-#        torch.arange(half, dtype=torch.float32, device=t.device) / half
-#    )
-#    args = t[:, None].float() * freqs[None]           # (B, half)
-#    embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)  # (B, dim)
-#    #if dim % 2:
-#    #    embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
-#    return embedding
-#
-#
-#def make_z(batch_size: int, seq_len: int, d_model: int, device=None) -> tuple:
-#    """Create zero initial HRM state."""
-#    z = torch.zeros(batch_size, seq_len, d_model, device=device)
-#    return z, z.clone()
-#
-## ============================================================
-## This is left here for completeness.
-## ============================================================
-## Score Transformer  (Section 5.1, Appendix C.2)
-## ============================================================
-## DiT-style encoder-only transformer (Peebles & Xie, 2023):
-##   - adaLN-zero time conditioning on σ̄(t)  (not t itself)
-##   - rotary positional embeddings  (Su et al., 2021)
-##   - separate input embedding and output projection matrices
-##   - output exponentiated for positivity; scaled by (e^σ̄ − 1)
-##     for absorb  (Appendix C.2)
-#
-#def _apply_rotary(x, cos, sin):
-#    """Apply rotary embedding to x: (B, H, L, D)."""
-#    d = x.shape[-1] // 2
-#    x1, x2 = x[..., :d], x[..., d:]
-#    return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
-#
-#
-#class _SelfAttention(nn.Module):
-#    def __init__(self, dim, num_heads):
-#        super().__init__()
-#        self.num_heads = num_heads
-#        self.head_dim = dim // num_heads
-#        self.qkv = nn.Linear(dim, 3 * dim, bias=False)
-#        self.out_proj = nn.Linear(dim, dim)
-#
-#    def forward(self, x, cos, sin):
-#        B, L, _ = x.shape
-#        qkv = self.qkv(x).reshape(B, L, 3, self.num_heads, self.head_dim)
-#        q, k, v = qkv.permute(2, 0, 3, 1, 4)          # 3 × (B,H,L,D)
-#        q = _apply_rotary(q, cos, sin)
-#        k = _apply_rotary(k, cos, sin)
-#        out = F.scaled_dot_product_attention(q, k, v)   # (B,H,L,D)
-#        out = out.transpose(1, 2).reshape(B, L, -1)
-#        return self.out_proj(out)
-#
-#
-#class _AdaLNBlock(nn.Module):
-#    """Transformer block with adaLN-zero conditioning (DiT)."""
-#    def __init__(self, dim, num_heads, mlp_ratio=4):
-#        super().__init__()
-#        self.res1 = BlockAttnResOp(dim)
-#        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False)
-#        self.attn = _SelfAttention(dim, num_heads)
-#        self.res2 = BlockAttnResOp(dim)
-#        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False)
-#        self.mlp = nn.Sequential(
-#            nn.Linear(dim, dim * mlp_ratio),
-#            nn.GELU(),
-#            nn.Linear(dim * mlp_ratio, dim))
-#        # 6 modulation parameters: (γ1, β1, α1, γ2, β2, α2)
-#        self.adaln = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim))
-#        nn.init.zeros_(self.adaln[-1].weight)
-#        nn.init.zeros_(self.adaln[-1].bias)
-#
-#    def forward(self, bd, c, cos, sin):
-#        g1, b1, a1, g2, b2, a2 = self.adaln(c).unsqueeze(1).chunk(6, dim=-1)
-#
-#        x = self.res1(bd)
-#        bd = bd.div()
-#        h = self.norm1(x) * (1 + g1) + b1
-#        bd = bd(a1 * self.attn(h, cos, sin))
-#
-#        x = self.res2(bd)
-#        bd = bd.div()
-#        h = self.norm2(x) * (1 + g2) + b2
-#        bd = bd(a2 * self.mlp(h))
-#        return bd
-#
-#
-#class ScoreTransformer(nn.Module):
-#    """
-#    Small DiT-style score network for SEDD (Section 5.1, Appendix C.2).
-#
-#    The network is conditioned on σ̄(t) (not t) via sinusoidal
-#    embeddings fed through adaLN-zero.  Outputs are exponentiated
-#    for positivity and optionally scaled by (e^σ̄ − 1) for absorb.
-#    """
-#    def __init__(self, n: int, max_len: int, dim: int = 256,
-#                 num_heads: int = 4, num_layers: int = 4,
-#                 mode: Literal["absorb", "uniform"] = "absorb"):
-#        super().__init__()
-#        self.n = n
-#        self.dim = dim
-#        self.mode = mode
-#
-#        self.tok_embed = nn.Embedding(n, dim)
-#        self.out_proj = nn.Linear(dim, n)
-#        # Initialise output bias negative so exp(logit) starts small
-#        nn.init.zeros_(self.out_proj.weight)
-#        nn.init.constant_(self.out_proj.bias, -6.0)
-#
-#        self.time_mlp = nn.Sequential(
-#            nn.Linear(dim, dim), nn.SiLU(), nn.Linear(dim, dim))
-#        self.blocks = nn.ModuleList(
-#            [_AdaLNBlock(dim, num_heads) for _ in range(num_layers)])
-#        self.final_res = BlockAttnResOp(dim)
-#        self.final_norm = nn.LayerNorm(dim)
-#
-#        # Precompute rotary frequencies
-#        head_dim = dim // num_heads
-#        half = head_dim // 2
-#        freqs = 1.0 / (10000.0 ** (torch.arange(half).float() / half))
-#        pos = torch.arange(max_len).float()
-#        angles = pos[:, None] * freqs[None, :]
-#        self.register_buffer("rot_cos", torch.cos(angles), persistent=False)
-#        self.register_buffer("rot_sin", torch.sin(angles), persistent=False)
-#
-#    def _time_embed(self, sigma_bar):
-#        half = self.dim // 2
-#        freqs = torch.exp(
-#            -math.log(10000.0) * torch.arange(half, device=sigma_bar.device) / half)
-#        args = sigma_bar[:, None] * freqs[None, :]
-#        emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
-#        return self.time_mlp(emb)                                 # (B, dim)
-#
-#    def forward(self, xt: torch.Tensor, sigma_bar: torch.Tensor):
-#        """
-#        Returns **log-scores** (not scores).
-#
-#        log s_θ = logits + log(e^σ̄ − 1)   for absorb
-#        log s_θ = logits                    for uniform
-#        """
-#        B, L = xt.shape
-#        h = self.tok_embed(xt)                                    # (B,L,D)
-#        c = self._time_embed(sigma_bar)                           # (B,D)
-#        cos = self.rot_cos[:L][None, None, :, :]                  # (1,1,L,half)
-#        sin = self.rot_sin[:L][None, None, :, :]
-#        bd = BlockDivider.top(h, block_size=1)
-#
-#        for block in self.blocks:
-#            bd = block(bd, c, cos, sin)
-#
-#        h = self.final_res(bd)
-#        h = self.final_norm(h)
-#        log_scores = self.out_proj(h)                             # (B,L,n)
-#
-#        # Absorb scaling in log-space: log(e^σ̄ − 1), stable (Appendix C.2)
-#        return Outlet()(log_scores, sigma_bar)
+    def get_front(self, xt, t, memory=None):
+        h, c, cos, sin = self.input(xt, t)
+        for layer in self.front_layers:
+            h = layer(h, c, cos, sin)
+        h, memory, importance_scores = self.latent_memory(h, memory)
+        return h, c, cos, sin, memory, importance_scores
+        # TODO: fill importance scores with zeroes
+        #       if latent memory not present
+
+    def get_back(self, h, c, cos, sin):
+        for layer in self.back_layers:
+            h = layer(h, c, cos, sin)
+        return h
+
+    def get_behind(self, h, c, cos, sin):
+        h = self.get_back(h, c, cos, sin)
+        return self.out_proj(h)
+
+    def get_hidden(self, xt, t, memory=None):
+        h, c, cos, sin, memory, importance_scores = self.get_front(xt, t, memory)
+        h = self.get_back(h, c, cos, sin)
+        return h, memory, importance_scores
+
+    def forward(self, xt, t, memory=None):
+        h, memory, importance_scores = self.get_hidden(xt, t, memory)
+        return self.out_proj(h), memory, importance_scores
+
+class Ponder(nn.Module):
+    """
+    Gated pondering system that connects to the denoiser through memory.
+    """
+    def __init__(self, cfg: SRLMConfig):
+        super().__init__()
+        dim = cfg.hidden_dim
+        mem_dim = cfg.gmem.memory_dim
+        num_slots = cfg.gmem.num_slots
+
+        # Difficulty gate: hidden state → scalar
+        self.gate = nn.Sequential(
+            nn.Linear(dim, dim // 4),
+            nn.GELU(),
+            nn.Linear(dim // 4, 2),
+        )
+
+        # PonderBlock operates in memory_dim space on memory slots
+        self.ponder = PonderBlock(
+            mem_dim, num_slots,
+            num_heads=cfg.num_heads,
+            N_H=cfg.ponder.N_H,
+            N_L=cfg.ponder.N_L,
+            noise_sigma=cfg.ponder.noise_sigma,
+            noise_type=cfg.ponder.noise_type,
+            use_attention=cfg.ponder.use_attention,
+            use_stablemax=cfg.ponder.use_stablemax,
+        )
+
+    def decide(self, h):
+        return torch.sigmoid(self.gate(h.mean(dim=1)))  # (B, 1)
+
+    def forward(self, memory, z_H=None, z_L=None):
+        """
+        Args:
+            memory: memory bank slots (B, num_slots, mem_dim)
+            z_H:    carried ponder state (B, num_slots, mem_dim) or None
+            z_L:    carried ponder state (B, num_slots, mem_dim) or None
+
+        Returns:
+            memory:     gated-updated memory
+            z_H, z_L:   ponder states (for carry-over)
+            q_values:   halt/continue Q-values (B, 2)
+            gate_value: difficulty activation (B, 1)
+        """
+        # Ponder over memory slots
+        z_H, z_L, q_values = self.ponder(memory, z_H, z_L)
+        return z_H, z_L, q_values
+
+def init_layer(cfg):
+    return Block(cfg.hidden_dim, cfg.num_heads, cfg.mlp_ratio, cfg.dropout)
+
+class InputLayer(nn.Module):
+    def __init__(self, vocab_size, dim, num_heads, max_context_length):
+        super().__init__()
+        self.dim = dim
+        self.tok_embed = nn.Embedding(vocab_size + 1, dim)  # +1 for MASK
+        self.time_mlp = nn.Sequential(
+                nn.Linear(dim, dim),
+                nn.SiLU(),
+                nn.Linear(dim, dim))
+
+        # Rotary position embeddings
+        head_dim = dim // num_heads
+        half = head_dim // 2
+        freqs = 1.0 / (10000.0 ** (torch.arange(half).float() / half))
+        pos = torch.arange(max_context_length).float()
+        angles = pos[:, None] * freqs[None, :]
+        self.register_buffer("rot_cos", torch.cos(angles), persistent=False)
+        self.register_buffer("rot_sin", torch.sin(angles), persistent=False)
+
+    def _time_embed(self, t):
+        """Sinusoidal time embedding → MLP."""
+        half = self.dim // 2
+        freqs = torch.exp(
+            -math.log(10000.0)
+            * torch.arange(half, device=t.device) / half)
+        args = t[:, None] * freqs[None, :]
+        emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+        return self.time_mlp(emb)
+
+    def forward(self, x, t):
+        B, L = x.shape
+        h = self.tok_embed(x)
+        c = self._time_embed(t)
+        cos = self.rot_cos[:L][None, None, :, :]
+        sin = self.rot_sin[:L][None, None, :, :]
+        return h, c, cos, sin
+
+class Block(nn.Module):
+    def __init__(self, dim, num_heads, mlp_ratio, dropout=0.0):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False)
+        self.attn = SelfAttention(dim, num_heads)
+        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, dim * mlp_ratio),
+            nn.GELU(),
+            nn.Linear(dim * mlp_ratio, dim))
+        # 6 modulation params: (γ₁, β₁, α₁, γ₂, β₂, α₂)
+        self.adaln = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim))
+        nn.init.zeros_(self.adaln[-1].weight)
+        nn.init.zeros_(self.adaln[-1].bias)
+
+        self.drop_attn = nn.Dropout(dropout)
+        self.drop_mlp  = nn.Dropout(dropout)
+
+    def forward(self, y, c, cos, sin):
+        g1, b1, a1, g2, b2, a2 = self.adaln(c).unsqueeze(1).chunk(6, dim=-1)
+        h = self.norm1(y) * (1 + g1) + b1
+        y = y + a1 * self.drop_attn(self.attn(h, cos, sin))
+        h = self.norm2(y) * (1 + g2) + b2
+        y = y + a2 * self.drop_mlp(self.mlp(h))
+        return y
+
+class SelfAttention(nn.Module):
+    def __init__(self, dim, num_heads):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.qkv = nn.Linear(dim, 3 * dim, bias=False)
+        self.out_proj = nn.Linear(dim, dim)
+
+    def forward(self, h, cos, sin):
+        B, L, _ = h.shape
+        qkv = self.qkv(h).reshape(B, L, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.permute(2, 0, 3, 1, 4)
+        q = _apply_rotary(q, cos, sin)
+        k = _apply_rotary(k, cos, sin)
+        out = F.scaled_dot_product_attention(q, k, v)
+        out = out.transpose(1, 2).reshape(B, L, -1)
+        return self.out_proj(out)
+
+def _apply_rotary(x, cos, sin):
+    d = x.shape[-1] // 2
+    x1, x2 = x[..., :d], x[..., d:]
+    return torch.cat([x1 * cos - x2 * sin,
+                      x2 * cos + x1 * sin], dim=-1)
+
+
+# ============================================================
+# Training losses
+# ============================================================
+
+def mdlm_loss(denoiser, x0, schedule, memory=None,
+              answer_mask=None, t_min=1e-4):
+    """
+    MDLM denoiser loss: cross-entropy on masked positions.
+
+    Returns:
+        loss, memory, importance_scores
+    """
+    mask_id = denoiser.cfg.vocab_size
+    loss_fn = MDLMLoss(schedule, mask_id, t_min=t_min)
+    xt, t, is_masked = loss_fn.perturb(x0, answer_mask=answer_mask)
+    logits, memory, importance_scores = denoiser(xt, t, memory)
+    loss = loss_fn(logits, x0, is_masked)
+    return loss, memory, importance_scores
+
+
+def nce_loss(energy_model, denoiser, x0, schedule,
+             memory=None, answer_mask=None, t_min=1e-4):
+    """
+    NCE loss for the energy model.
+    Denoiser is frozen (no_grad); only energy_model gets gradients.
+
+    Returns:
+        loss, memory, importance_scores
+    """
+    n_vocab = denoiser.cfg.vocab_size
+    mask_id = n_vocab
+    loss_fn = NCELoss(schedule, mask_id, n_vocab, t_min=t_min)
+
+    xt, t, is_masked = loss_fn.perturb(x0, answer_mask=answer_mask)
+
+    # Negative sample from frozen denoiser
+    with torch.no_grad():
+        logits, memory, importance_scores = denoiser(xt, t, memory)
+    x_neg = loss_fn.sample_neg(x0, logits, is_masked)
+
+    # Energies — positive (true x0) and negative (denoiser sample)
+    e_pos, _, _ = energy_model(x0, t, memory)
+    e_neg, _, _ = energy_model(x_neg, t, memory)
+
+    loss = loss_fn(e_pos, e_neg)
+    return loss, memory, importance_scores
+
+
+# ============================================================
+# Sampling
+# ============================================================
+
+@torch.no_grad()
+def sample(denoiser, schedule, batch_size, seq_len, num_steps=256,
+           energy_model=None, k=8, window_w=0.2,
+           memory=None,
+           device=torch.device("cpu")):
+    """
+    MDLM / EDLM sampling with memory
+
+    Args:
+        denoiser:      SRLMDenoiser
+        schedule:      LogLinearSchedule
+        energy_model:  SRLMEnergyModel or None (pure MDLM if None)
+        k:             importance sampling candidates (only with energy_model)
+        window_w:      importance sampling window [1-w, 1]
+        memory:        initial G-Mem state or None
+
+    Returns:
+        xt:      generated tokens (batch_size, seq_len)
+        memory:  final memory state
+    """
+    n_vocab = denoiser.cfg.vocab_size
+    mask_id = n_vocab
+    sampler = Sampler(schedule, mask_id, n_vocab)
+    xt, stepper = sampler(batch_size, seq_len, device, num_steps)
+
+    for s in stepper:
+        logits, memory, _ = denoiser(xt, s.t, memory)
+        if energy_model is not None and s.tau_n >= 1.0 - window_w:
+            candidates = s.propose_x0_k(xt, logits, k)       # (k, B, L)
+            c_flat = candidates.reshape(k * batch_size, seq_len)
+            t_flat = s.t.unsqueeze(0).expand(k, -1).reshape(k * batch_size)
+            if memory is not None:
+                mem_flat = memory.unsqueeze(0).expand(k, -1, -1, -1) \
+                                 .reshape(k * batch_size, *memory.shape[1:])
+            else:
+                mem_flat = None
+            energies, _, _ = energy_model(c_flat, t_flat, mem_flat)
+            energies = energies.reshape(k, batch_size)
+            x0 = s.select_by_energy(candidates, energies)
+        else:
+            x0 = s.propose_x0(xt, logits)
+
+        xt = s.reverse_step(xt, x0)
+
+    return xt, memory
+
+
+# ============================================================
+# Ponder-enhanced forward (no deep supervision, just better logits)
+# ============================================================
+
+def ponder_forward(denoiser, xt, t, memory=None, n_ponder=3):
+    """
+    Forward pass with pondering for reasoning tasks.
+
+    Runs front layers → ponder over memory → gated write-back →
+    re-read memory → back layers → logits.
+
+    Unlike PonderTrainer (deep supervision), this is a single forward
+    pass suitable for use inside GRPO or plain training on hard tasks.
+
+    Returns:
+        logits, memory, importance_scores
+    """
+    h_front, c, cos, sin, memory, importance_scores = denoiser.get_front(xt, t, memory)
+
+    z_H, z_L = None, None
+    for _ in range(n_ponder):
+        z_H, z_L, q_values = denoiser.ponder(memory, z_H, z_L)
+        h_for_gate, _, _ = denoiser.latent_memory(h_front, memory)
+        gate = denoiser.ponder.decide(h_for_gate)[:, 0:1].unsqueeze(-1)
+        memory = memory + gate * (z_H - memory)
+
+    # Re-read memory so ponder's updates flow into logits
+    h, _, _ = denoiser.latent_memory(h_front, memory)
+    logits = denoiser.get_behind(h, c, cos, sin)
+    return logits, memory, importance_scores
+
+
+# ============================================================
+# Ponder Training (deep supervision through SRLM)
+# ============================================================
+
+@dataclass
+class PonderTrainer:
+    """
+    Deep supervision trainer for the PonderBlock inside SRLM.
+
+    Per segment:
+      1. Read memory via G-Mem cross-attention → h
+      2. Ponder over memory slots → z_H, z_L
+      3. Gated write-back: memory += gate * (z_H - memory)
+      4. Re-read memory → h_enriched  (so ponder gets gradient signal)
+      5. get_behind(h_enriched) → logits → F.cross_entropy
+
+    Front layers (input + transformer blocks) run once.
+    G-Mem re-reads each segment so ponder's memory updates
+    flow into the logits and produce gradients.
+    """
+    denoiser: SRLMDenoiser
+    schedule: Any
+    N_super: int = 16
+    lambda_LM: float = 1.0
+    lambda_BCE: float = 0.5
+    lambda_mem: float = 0.01
+    lambda_rep: float = 1e3
+    lambda_equil: float = 1.0
+    lambda_RH_stable: float = 1e4
+
+    def train_step(
+        self,
+        x0: torch.Tensor,
+        optimizer: torch.optim.Optimizer,
+        memory: Optional[torch.Tensor] = None,
+        answer_mask: Optional[torch.Tensor] = None,
+        t_min: float = 1e-4,
+    ) -> tuple[dict[str, float], torch.Tensor]:
+        """
+        Returns:
+            losses:  dict of loss values for logging
+            memory:  updated memory state (detached)
+        """
+        denoiser = self.denoiser
+        denoiser.train()
+        mask_id = denoiser.cfg.vocab_size
+        device = x0.device
+
+        # Perturb x0 once — same noising for all segments
+        loss_fn = MDLMLoss(self.schedule, mask_id, t_min=t_min)
+        xt, t, is_masked = loss_fn.perturb(x0, answer_mask=answer_mask)
+
+        # Front layers once (shared across segments)
+        h_front, c, cos, sin = denoiser.input(xt, t)
+        for layer in denoiser.front_layers:
+            h_front = layer(h_front, c, cos, sin)
+
+        # Initial memory read
+        _, memory, importance_scores = denoiser.latent_memory(h_front, memory)
+
+        z_H = None
+        z_L = None
+
+        all_losses = {k: 0.0 for k in [
+            "LM", "BCE", "mem", "rep", "equil", "RH_stable", "total"
+        ]}
+
+        for seg in range(self.N_super):
+            # Ponder over memory slots
+            z_H_new, z_L_new, q_values = denoiser.ponder(memory, z_H, z_L)
+
+            # Gated memory write-back
+            # decide() uses hidden state to assess difficulty
+            h_for_gate, _, _ = denoiser.latent_memory(h_front, memory)
+            q_gate = denoiser.ponder.decide(h_for_gate)  # (B, 2)
+            gate = q_gate[:, 0:1].unsqueeze(-1)           # (B, 1, 1)
+            memory = memory + gate * (z_H_new - memory)
+
+            # Re-read memory so ponder's updates flow into logits
+            h, _, _ = denoiser.latent_memory(h_front, memory)
+
+            # Observe via back layers
+            logits = denoiser.get_behind(h, c, cos, sin)
+
+            # --- Losses ---
+            losses = {}
+            losses["LM"] = loss_fn(logits, x0, is_masked)
+
+            # ACT halt loss
+            with torch.no_grad():
+                correct = (logits.argmax(-1) == x0).all(dim=-1).float()
+            target = torch.stack([correct, 1.0 - correct], dim=-1)
+            losses["BCE"] = F.binary_cross_entropy(q_values, target)
+
+            # Memory regularization
+            if importance_scores is not None:
+                mem_loss_fn = MemoryLoss()
+                losses["mem"] = mem_loss_fn(importance_scores)
+            else:
+                losses["mem"] = torch.tensor(0.0, device=device)
+
+            losses["rep"] = repulsion_loss(z_H_new)
+
+            # Expensive losses only on last segment
+            is_last = (seg == self.N_super - 1)
+            if is_last:
+                block = denoiser.ponder.ponder.block
+                losses["equil"] = equilibrium_loss(z_H_new, z_L_new, block)
+                losses["RH_stable"] = routh_hurwitz_stable_loss(
+                    z_H_new + z_L_new, block)
+            else:
+                losses["equil"] = torch.tensor(0.0, device=device)
+                losses["RH_stable"] = torch.tensor(0.0, device=device)
+
+            total = (
+                self.lambda_LM * losses["LM"]
+                + self.lambda_BCE * losses["BCE"]
+                + self.lambda_mem * losses["mem"]
+                + self.lambda_rep * losses["rep"]
+                + self.lambda_equil * losses["equil"]
+                + self.lambda_RH_stable * losses["RH_stable"]
+            ) / self.N_super
+
+            total.backward(retain_graph=(seg < self.N_super - 1))
+
+            # Detach for next segment
+            z_H = z_H_new.detach()
+            z_L = z_L_new.detach()
+            memory = memory.detach()
+
+            for k, v in losses.items():
+                all_losses[k] += v.item()
+            all_losses["total"] += total.item() * self.N_super
+
+            # ACT early stopping
+            with torch.no_grad():
+                q_mean = q_values.mean(0)
+                if q_mean[0] > q_mean[1] and seg >= 1:
+                    break
+
+        torch.nn.utils.clip_grad_norm_(denoiser.parameters(), 1.0)
+        optimizer.step()
+        optimizer.zero_grad()
+
+        n_run = seg + 1
+        return {k: v / n_run for k, v in all_losses.items()}, memory

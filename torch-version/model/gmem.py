@@ -12,7 +12,7 @@ Usage:
     gmem = GMemLLM(model, num_slots=1024, memory_dim=256)
     # Only gmem's memory parameters are trained; the LLM stays frozen.
 """
-
+from dataclasses import dataclass
 import math
 import torch
 import torch.nn as nn
@@ -221,6 +221,20 @@ class LatentMemoryBank(nn.Module):
         updated_memory = self.gated_update(memory, m_attended)
 
         return enhanced_hidden, updated_memory, importance_scores
+
+
+@dataclass
+class MemoryLoss:
+    lambda_sparsity: float = 0.01
+    lambda_entropy: float = 0.01
+    def __call__(self, importance_scores):
+        # Memory regularization
+        l_sparsity = importance_scores.abs().mean()
+        p = F.softmax(importance_scores, dim=-1)
+        l_entropy = (p * p.log()).sum(dim=-1).mean()
+        mem_loss = self.lambda_sparsity * l_sparsity + self.lambda_entropy * l_entropy
+        return mem_loss
+
 
 
 class GMemLLM(nn.Module):
