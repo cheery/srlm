@@ -22,7 +22,10 @@ from .edlm import (
         MDLMLoss, NCELoss, mask_tokens, Sampler, SamplingStep,
         LogLinearSchedule, EnergyModelBase,
 )
-from .gmem import LatentMemoryBank, MemoryLoss
+from .gmem import (
+        LatentMemoryTerminal, LatentMemoryIn,
+        LatentMemoryBank, MemoryLoss
+)
 from .cmm import (
     PonderBlock, equilibrium_loss, routh_hurwitz_stable_loss,
     routh_hurwitz_unstable_loss, repulsion_loss,
@@ -67,14 +70,54 @@ class SRLMEnergyModel(EnergyModelBase):
         h, memory, importance_scores = self.denoiser.get_hidden(x0, t, memory)
         return self.outlet(h), memory, importance_scores
 
+class SRLMPonder(nn.Module):
+    def __init__(self, cfg: SRLMConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.input = UnmaskedInputLayer(cfg.vocab_size,
+                                        cfg.hidden_dim,
+                                        cfg.num_heads,
+                                        cfg.max_context_length)
+        self.front_memory = LatentMemoryIn(cfg.hidden_dim,
+                                           cfg.gmem.memory_dim,
+                                           cfg.num_heads)
+        self.ponder = PonderBlock(
+            cfg.hidden_dim,
+            cfg.max_context_length,
+            num_heads=cfg.num_heads,
+            N_H=cfg.ponder.N_H,
+            N_L=cfg.ponder.N_L,
+            noise_sigma=cfg.ponder.noise_sigma,
+            noise_type=cfg.ponder.noise_type,
+            use_attention=cfg.ponder.use_attention,
+            use_stablemax=cfg.ponder.use_stablemax,
+        )
+        self.back_memory = LatentMemoryTerminal(cfg.hidden_dim,
+                                            cfg.gmem.memory_dim,
+                                            cfg.num_heads)
+
+    def get_front(self, xt, memory):
+        h, cos, sin = self.input(xt)
+        h, importance_scores = self.front_memory(h, memory)
+        return h, cos, sin, importance_scores
+
+    def init_states(self, h):
+        z_H = h.clone()
+        z_L = torch.zeros_like(h)
+        return z_H, z_L
+
+    def forward(self, z_H, memory):
+        memory = self.back_memory(z_H, memory)
+        return memory
+
 class SRLMDenoiser(nn.Module):
     def __init__(self, cfg: SRLMConfig):
         super().__init__()
         self.cfg = cfg
-        self.input = InputLayer(cfg.vocab_size,
-                                cfg.hidden_dim,
-                                cfg.num_heads,
-                                cfg.max_context_length)
+        self.input = MaskedInputLayer(cfg.vocab_size,
+                                      cfg.hidden_dim,
+                                      cfg.num_heads,
+                                      cfg.max_context_length)
         self.front_layers = nn.ModuleList([
             init_layer(cfg)
             for _ in range(cfg.front_layers)
@@ -82,9 +125,7 @@ class SRLMDenoiser(nn.Module):
         self.latent_memory = LatentMemoryBank(
                     cfg.hidden_dim,
                     cfg.gmem.memory_dim,
-                    cfg.gmem.num_slots,
                     cfg.num_heads)
-        self.ponder = Ponder(cfg)
         self.back_layers = nn.ModuleList([
             init_layer(cfg)
             for _ in range(cfg.back_layers)
@@ -93,19 +134,19 @@ class SRLMDenoiser(nn.Module):
         nn.init.zeros_(self.out_proj.weight)
         nn.init.constant_(self.out_proj.bias, -6.0)
 
-    def decide(self, xt, t, memory=None):
-        h, c, cos, sin, memory, importance_scores = self.get_front(xt, t, memory)
-        q = self.ponder.decide(h)
-        return q, h, c, cos, sin, memory, importance_scores
+    def init_memory(self, batch_size, device):
+        """Create zero-initialized memory state."""
+        return torch.zeros(batch_size, self.cfg.gmem.num_slots,
+                           self.cfg.gmem.memory_dim, device=device)
 
     def get_front(self, xt, t, memory=None):
         h, c, cos, sin = self.input(xt, t)
         for layer in self.front_layers:
             h = layer(h, c, cos, sin)
+        if memory is None:
+            memory = self.init_memory(h.shape[0], h.device)
         h, memory, importance_scores = self.latent_memory(h, memory)
         return h, c, cos, sin, memory, importance_scores
-        # TODO: fill importance scores with zeroes
-        #       if latent memory not present
 
     def get_back(self, h, c, cos, sin):
         for layer in self.back_layers:
@@ -125,68 +166,13 @@ class SRLMDenoiser(nn.Module):
         h, memory, importance_scores = self.get_hidden(xt, t, memory)
         return self.out_proj(h), memory, importance_scores
 
-class Ponder(nn.Module):
-    """
-    Gated pondering system that connects to the denoiser through memory.
-    """
-    def __init__(self, cfg: SRLMConfig):
-        super().__init__()
-        dim = cfg.hidden_dim
-        mem_dim = cfg.gmem.memory_dim
-        num_slots = cfg.gmem.num_slots
-
-        # Difficulty gate: hidden state → scalar
-        self.gate = nn.Sequential(
-            nn.Linear(dim, dim // 4),
-            nn.GELU(),
-            nn.Linear(dim // 4, 2),
-        )
-
-        # PonderBlock operates in memory_dim space on memory slots
-        self.ponder = PonderBlock(
-            mem_dim, num_slots,
-            num_heads=cfg.num_heads,
-            N_H=cfg.ponder.N_H,
-            N_L=cfg.ponder.N_L,
-            noise_sigma=cfg.ponder.noise_sigma,
-            noise_type=cfg.ponder.noise_type,
-            use_attention=cfg.ponder.use_attention,
-            use_stablemax=cfg.ponder.use_stablemax,
-        )
-
-    def decide(self, h):
-        return torch.sigmoid(self.gate(h.mean(dim=1)))  # (B, 1)
-
-    def forward(self, memory, z_H=None, z_L=None):
-        """
-        Args:
-            memory: memory bank slots (B, num_slots, mem_dim)
-            z_H:    carried ponder state (B, num_slots, mem_dim) or None
-            z_L:    carried ponder state (B, num_slots, mem_dim) or None
-
-        Returns:
-            memory:     gated-updated memory
-            z_H, z_L:   ponder states (for carry-over)
-            q_values:   halt/continue Q-values (B, 2)
-            gate_value: difficulty activation (B, 1)
-        """
-        # Ponder over memory slots
-        z_H, z_L, q_values = self.ponder(memory, z_H, z_L)
-        return z_H, z_L, q_values
-
 def init_layer(cfg):
     return Block(cfg.hidden_dim, cfg.num_heads, cfg.mlp_ratio, cfg.dropout)
 
-class InputLayer(nn.Module):
-    def __init__(self, vocab_size, dim, num_heads, max_context_length):
+class BaseInputLayer(nn.Module):
+    def __init__(self, dim, num_heads, max_context_length):
         super().__init__()
         self.dim = dim
-        self.tok_embed = nn.Embedding(vocab_size + 1, dim)  # +1 for MASK
-        self.time_mlp = nn.Sequential(
-                nn.Linear(dim, dim),
-                nn.SiLU(),
-                nn.Linear(dim, dim))
-
         # Rotary position embeddings
         head_dim = dim // num_heads
         half = head_dim // 2
@@ -195,6 +181,27 @@ class InputLayer(nn.Module):
         angles = pos[:, None] * freqs[None, :]
         self.register_buffer("rot_cos", torch.cos(angles), persistent=False)
         self.register_buffer("rot_sin", torch.sin(angles), persistent=False)
+
+class UnmaskedInputLayer(BaseInputLayer):
+    def __init__(self, vocab_size, dim, num_heads, max_context_length):
+        super().__init__(dim, num_heads, max_context_length)
+        self.tok_embed = nn.Embedding(vocab_size, dim)
+
+    def forward(self, x):
+        B, L = x.shape
+        h = self.tok_embed(x)
+        cos = self.rot_cos[:L][None, None, :, :]
+        sin = self.rot_sin[:L][None, None, :, :]
+        return h, cos, sin
+
+class MaskedInputLayer(BaseInputLayer):
+    def __init__(self, vocab_size, dim, num_heads, max_context_length):
+        super().__init__(dim, num_heads, max_context_length)
+        self.tok_embed = nn.Embedding(vocab_size + 1, dim)  # +1 for MASK
+        self.time_mlp = nn.Sequential(
+                nn.Linear(dim, dim),
+                nn.SiLU(),
+                nn.Linear(dim, dim))
 
     def _time_embed(self, t):
         """Sinusoidal time embedding → MLP."""
@@ -368,31 +375,41 @@ def sample(denoiser, schedule, batch_size, seq_len, num_steps=256,
 # Ponder-enhanced forward (no deep supervision, just better logits)
 # ============================================================
 
-def ponder_forward(denoiser, xt, t, memory=None, n_ponder=3):
+def ponder_forward(ponder, denoiser, x0, xt, t, memory=None, n_ponder=3):
     """
     Forward pass with pondering for reasoning tasks.
 
-    Runs front layers → ponder over memory → gated write-back →
-    re-read memory → back layers → logits.
+    SRLMPonder reads clean x0 into memory via:
+      input → front_memory(read) → PonderBlock → back_memory(write)
+    Then SRLMDenoiser uses the enriched memory to denoise xt.
 
     Unlike PonderTrainer (deep supervision), this is a single forward
     pass suitable for use inside GRPO or plain training on hard tasks.
 
+    Args:
+        ponder:   SRLMPonder — reads context into memory
+        denoiser: SRLMDenoiser — denoises using enriched memory
+        x0:       clean tokens for ponder to read
+        xt:       masked tokens for denoiser
+        t:        diffusion time
+        memory:   G-Mem state or None
+        n_ponder: PonderBlock iterations
+
     Returns:
         logits, memory, importance_scores
     """
-    h_front, c, cos, sin, memory, importance_scores = denoiser.get_front(xt, t, memory)
+    if memory is None:
+        memory = denoiser.init_memory(x0.shape[0], x0.device)
 
-    z_H, z_L = None, None
+    # Ponder reads clean context into memory
+    h_p, cos_p, sin_p, importance_scores = ponder.get_front(x0, memory)
+    z_H, z_L = ponder.init_states(h_p)
     for _ in range(n_ponder):
-        z_H, z_L, q_values = denoiser.ponder(memory, z_H, z_L)
-        h_for_gate, _, _ = denoiser.latent_memory(h_front, memory)
-        gate = denoiser.ponder.decide(h_for_gate)[:, 0:1].unsqueeze(-1)
-        memory = memory + gate * (z_H - memory)
+        z_H, z_L, q_values = ponder.ponder(h_p, z_H, z_L)
+    memory = ponder(z_H, memory)
 
-    # Re-read memory so ponder's updates flow into logits
-    h, _, _ = denoiser.latent_memory(h_front, memory)
-    logits = denoiser.get_behind(h, c, cos, sin)
+    # Denoiser uses enriched memory
+    logits, _, _ = denoiser(xt, t, memory)
     return logits, memory, importance_scores
 
 
@@ -403,28 +420,32 @@ def ponder_forward(denoiser, xt, t, memory=None, n_ponder=3):
 @dataclass
 class PonderTrainer:
     """
-    Deep supervision trainer for the PonderBlock inside SRLM.
+    Deep supervision trainer for SRLMPonder + SRLMDenoiser.
+
+    SRLMPonder reads clean x0 into memory (context comprehension).
+    SRLMDenoiser uses that memory to denoise masked tokens.
+    Loss from denoising quality tells ponder how well it prepared memory.
 
     Per segment:
-      1. Read memory via G-Mem cross-attention → h
-      2. Ponder over memory slots → z_H, z_L
-      3. Gated write-back: memory += gate * (z_H - memory)
-      4. Re-read memory → h_enriched  (so ponder gets gradient signal)
-      5. get_behind(h_enriched) → logits → F.cross_entropy
+      1. PonderBlock iteration → z_H, z_L
+      2. Write z_H to memory via LatentMemoryTerminal
+      3. Denoiser reads enriched memory → back layers → logits
+      4. CE loss on masked positions
 
-    Front layers (input + transformer blocks) run once.
-    G-Mem re-reads each segment so ponder's memory updates
-    flow into the logits and produce gradients.
+    Denoiser front layers run once. Ponder front (input + memory read)
+    runs once. Each segment does one PonderBlock pass + memory write +
+    denoiser read + loss.
     """
+    ponder: 'SRLMPonder'
     denoiser: SRLMDenoiser
     schedule: Any
     N_super: int = 16
     lambda_LM: float = 1.0
-    lambda_BCE: float = 0.5
+    lambda_BCE: float = 0.1
     lambda_mem: float = 0.01
-    lambda_rep: float = 1e3
-    lambda_equil: float = 1.0
-    lambda_RH_stable: float = 1e4
+    lambda_rep: float = 0.1
+    lambda_equil: float = 0.1
+    lambda_RH_stable: float = 0.1
 
     def train_step(
         self,
@@ -432,52 +453,62 @@ class PonderTrainer:
         optimizer: torch.optim.Optimizer,
         memory: Optional[torch.Tensor] = None,
         answer_mask: Optional[torch.Tensor] = None,
+        ponder_x0: Optional[torch.Tensor] = None,
         t_min: float = 1e-4,
     ) -> tuple[dict[str, float], torch.Tensor]:
         """
+        Args:
+            x0:        clean tokens (denoiser target, answer included)
+            optimizer: shared optimizer for ponder + denoiser
+            memory:    G-Mem state or None
+            answer_mask: (B, L) bool — True at answer positions to noise
+            ponder_x0: separate clean tokens for ponder (e.g. question only).
+                       If None, ponder sees x0.
+            t_min:     minimum diffusion time
+
         Returns:
             losses:  dict of loss values for logging
             memory:  updated memory state (detached)
         """
+        ponder = self.ponder
         denoiser = self.denoiser
+        ponder.train()
         denoiser.train()
         mask_id = denoiser.cfg.vocab_size
         device = x0.device
+
+        if memory is None:
+            memory = denoiser.init_memory(x0.shape[0], device)
+
+        # What ponder sees: question only (if provided) or full x0
+        ponder_input = ponder_x0 if ponder_x0 is not None else x0
 
         # Perturb x0 once — same noising for all segments
         loss_fn = MDLMLoss(self.schedule, mask_id, t_min=t_min)
         xt, t, is_masked = loss_fn.perturb(x0, answer_mask=answer_mask)
 
-        # Front layers once (shared across segments)
+        # Denoiser front layers once (shared across segments)
         h_front, c, cos, sin = denoiser.input(xt, t)
         for layer in denoiser.front_layers:
             h_front = layer(h_front, c, cos, sin)
 
-        # Initial memory read
-        _, memory, importance_scores = denoiser.latent_memory(h_front, memory)
-
-        z_H = None
-        z_L = None
+        # Ponder front once: embed ponder_input, read from memory
+        h_ponder, _, _, importance_scores = ponder.get_front(ponder_input, memory)
+        z_H, z_L = ponder.init_states(h_ponder)
 
         all_losses = {k: 0.0 for k in [
             "LM", "BCE", "mem", "rep", "equil", "RH_stable", "total"
         ]}
 
         for seg in range(self.N_super):
-            # Ponder over memory slots
-            z_H_new, z_L_new, q_values = denoiser.ponder(memory, z_H, z_L)
+            # PonderBlock iteration
+            z_H_new, z_L_new, q_values = ponder.ponder(h_ponder, z_H, z_L)
 
-            # Gated memory write-back
-            # decide() uses hidden state to assess difficulty
-            h_for_gate, _, _ = denoiser.latent_memory(h_front, memory)
-            q_gate = denoiser.ponder.decide(h_for_gate)  # (B, 2)
-            gate = q_gate[:, 0:1].unsqueeze(-1)           # (B, 1, 1)
-            memory = memory + gate * (z_H_new - memory)
+            # Write ponder result to memory
+            memory_updated = ponder(z_H_new, memory)
 
-            # Re-read memory so ponder's updates flow into logits
-            h, _, _ = denoiser.latent_memory(h_front, memory)
-
-            # Observe via back layers
+            # Denoiser reads enriched memory → logits
+            h, _, _ = denoiser.latent_memory(h_front, memory_updated)
             logits = denoiser.get_behind(h, c, cos, sin)
 
             # --- Losses ---
@@ -502,7 +533,7 @@ class PonderTrainer:
             # Expensive losses only on last segment
             is_last = (seg == self.N_super - 1)
             if is_last:
-                block = denoiser.ponder.ponder.block
+                block = ponder.ponder.block
                 losses["equil"] = equilibrium_loss(z_H_new, z_L_new, block)
                 losses["RH_stable"] = routh_hurwitz_stable_loss(
                     z_H_new + z_L_new, block)
@@ -524,7 +555,7 @@ class PonderTrainer:
             # Detach for next segment
             z_H = z_H_new.detach()
             z_L = z_L_new.detach()
-            memory = memory.detach()
+            memory = memory_updated.detach()
 
             for k, v in losses.items():
                 all_losses[k] += v.item()
@@ -537,6 +568,7 @@ class PonderTrainer:
                     break
 
         torch.nn.utils.clip_grad_norm_(denoiser.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(ponder.parameters(), 1.0)
         optimizer.step()
         optimizer.zero_grad()
 

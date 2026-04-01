@@ -330,7 +330,7 @@ class MDLMLoss:
     def __call__(self, logits, x0, is_masked):
         n_masked = is_masked.float().sum()
         if n_masked == 0:
-            return torch.tensor(0.0, device=device, requires_grad=True)
+            return torch.tensor(0.0, device=x0.device, requires_grad=True)
 
         ce = F.cross_entropy(
             logits.transpose(1, 2), x0.long(), reduction='none')  # (B, L)

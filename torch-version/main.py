@@ -26,7 +26,7 @@ import torch.optim as optim
 
 from model.model import (
     SRLMConfig, GMemConfig, PonderConfig,
-    SRLMDenoiser, SRLMEnergyModel,
+    SRLMDenoiser, SRLMEnergyModel, SRLMPonder,
     mdlm_loss, nce_loss, sample, ponder_forward, PonderTrainer,
 )
 from model.edlm import LogLinearSchedule, Sampler
@@ -47,7 +47,7 @@ PARQUET_FILES = [
 ]
 
 DEFAULT_CONFIG = SRLMConfig(
-    gmem   = GMemConfig(memory_dim=256, num_slots=512),
+    gmem   = GMemConfig(memory_dim=128, num_slots=64),
     ponder = PonderConfig(N_H=3, N_L=6),
 )
 
@@ -105,9 +105,11 @@ def sample_batch_random(raw: torch.Tensor, seq_len: int, batch: int) -> torch.Te
 
 def save_checkpoint(ckpt_dir: Path, model: nn.Module, config: SRLMConfig,
                     training_log: str, wiki_state: dict | None = None,
-                    ema=None):
+                    ema=None, ponder=None):
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     torch.save(model.state_dict(), ckpt_dir / "parameters.pt")
+    if ponder is not None:
+        torch.save(ponder.state_dict(), ckpt_dir / "ponder.pt")
     if ema is not None:
         torch.save(ema.state_dict(), ckpt_dir / "ema.pt")
     with open(ckpt_dir / "config.json", "w") as f:
@@ -202,7 +204,8 @@ class MemoryReplayBuffer:
             h, c, cos, sin = denoiser.input(x0, t_zero)
             for layer in denoiser.front_layers:
                 h = layer(h, c, cos, sin)
-            _, memory, _ = denoiser.latent_memory(h, None)
+            memory = denoiser.init_memory(x0.shape[0], device)
+            _, memory, _ = denoiser.latent_memory(h, memory)
             self.entries[i] = (tokens, memory.detach().cpu(), answer_mask)
 
 
@@ -313,6 +316,11 @@ class SudokuProgram:
 
     Format: 9 rows of 9 digits separated by newlines (89 bytes).
     answer_mask is True where puzzle has '0' (blanks to predict).
+
+    Returns 3-tuple: (solution_tokens, answer_mask, puzzle_tokens)
+      - solution_tokens: full solution (denoiser target)
+      - answer_mask: True at blank positions
+      - puzzle_tokens: puzzle with '_' for blanks (ponder input)
     """
 
     def __init__(self, seq_len, batch_size, max_steps=None,
@@ -331,6 +339,10 @@ class SudokuProgram:
         rows = [digits_81[i:i+9] for i in range(0, 81, 9)]
         return "\n".join(rows)
 
+    def _format_puzzle(self, digits_81):
+        """Format puzzle with '_' replacing '0' blanks."""
+        return self._format_grid(digits_81.replace('0', '_'))
+
     def done(self):
         return self.max_steps is not None and self.step_count >= self.max_steps
 
@@ -339,12 +351,13 @@ class SudokuProgram:
             return None
 
         batch = torch.full((self.batch_size, self.seq_len), ord(' '), dtype=torch.int32)
+        puzzle_batch = torch.full((self.batch_size, self.seq_len), ord(' '), dtype=torch.int32)
         answer_mask = torch.zeros(self.batch_size, self.seq_len, dtype=torch.bool)
 
         for i in range(self.batch_size):
             idx = torch.randint(0, len(self.puzzles), ()).item()
-            puzzle_grid   = self._format_grid(self.puzzles[idx])
             solution_grid = self._format_grid(self.solutions[idx])
+            puzzle_grid   = self._format_puzzle(self.puzzles[idx])
 
             sol_tokens = torch.frombuffer(
                 bytearray(solution_grid.encode()), dtype=torch.uint8).to(torch.int32)
@@ -353,20 +366,27 @@ class SudokuProgram:
 
             L = min(len(sol_tokens), self.seq_len)
             batch[i, :L] = sol_tokens[:L]
-            # Mask where puzzle has '0'
+            puzzle_batch[i, :L] = puz_tokens[:L]
+            # Mask where puzzle has '_' (was '0')
             for j in range(L):
-                if puz_tokens[j] == ord('0'):
+                if puz_tokens[j] == ord('_'):
                     answer_mask[i, j] = True
 
         self.step_count += 1
-        return batch, answer_mask
+        return batch, answer_mask, puzzle_batch
 
     def description(self):
         return f"sudoku({self.max_steps or 'inf'}, done={self.step_count})"
 
 
 class QAProgram:
-    """Question-answer pairs from JSONL. Question shown, answer masked."""
+    """Question-answer pairs from JSONL.
+
+    Returns (answer_tokens, answer_mask, question_tokens):
+      - answer_tokens: full sequence with answer filled in (denoiser target)
+      - answer_mask: True at answer positions
+      - question_tokens: question only, padded (ponder input)
+    """
 
     def __init__(self, path, seq_len, batch_size, max_steps=None):
         self.seq_len    = seq_len
@@ -391,6 +411,7 @@ class QAProgram:
             return None
 
         batch = torch.full((self.batch_size, self.seq_len), ord(' '), dtype=torch.int32)
+        question_batch = torch.full((self.batch_size, self.seq_len), ord(' '), dtype=torch.int32)
         answer_mask = torch.zeros(self.batch_size, self.seq_len, dtype=torch.bool)
 
         indices = torch.randint(0, len(self.pairs), (self.batch_size,))
@@ -405,10 +426,11 @@ class QAProgram:
             Lf = min(len(full_tok), self.seq_len)
             Lp = min(len(prefix_tok), self.seq_len)
             batch[i, :Lf] = full_tok[:Lf]
+            question_batch[i, :Lp] = prefix_tok[:Lp]
             answer_mask[i, Lp:Lf] = True
 
         self.step_count += 1
-        return batch, answer_mask
+        return batch, answer_mask, question_batch
 
     def description(self):
         return f"qa({self.max_steps or 'inf'}, done={self.step_count})"
@@ -442,6 +464,8 @@ def cmd_train(args):
         config.gmem.memory_dim = args.hidden_dim
     if args.num_heads:
         config.num_heads = args.num_heads
+    if args.num_slots:
+        config.gmem.num_slots = args.num_slots
 
     seq_len    = config.max_context_length
     batch_size = args.batch_size
@@ -451,10 +475,20 @@ def cmd_train(args):
     print("Initialising model...")
     denoiser = SRLMDenoiser(config).to(device)
     load_checkpoint(denoiser, ckpt_path)
-    print(f"Parameters:       {param_count(denoiser):,}")
-    print(f"Parameter memory: {param_memory_mb(denoiser):.1f} MB")
+    print(f"Denoiser params:  {param_count(denoiser):,}")
+    print(f"Denoiser memory:  {param_memory_mb(denoiser):.1f} MB")
 
-    optimizer = optim.AdamW(denoiser.parameters(), lr=args.lr, weight_decay=0.01)
+    ponder_model = SRLMPonder(config).to(device)
+    ponder_path = ckpt_path / "ponder.pt"
+    if ponder_path.exists():
+        ponder_model.load_state_dict(
+            torch.load(ponder_path, map_location=device, weights_only=True))
+        print(f"Loaded ponder from {ponder_path}")
+    print(f"Ponder params:    {param_count(ponder_model):,}")
+
+    # Optimizer covers both denoiser and ponder
+    all_params = list(denoiser.parameters()) + list(ponder_model.parameters())
+    optimizer = optim.AdamW(all_params, lr=args.lr, weight_decay=0.01)
     ema = EMA(denoiser, mu=0.999)
 
     ema_path = ckpt_path / "ema.pt"
@@ -464,6 +498,7 @@ def cmd_train(args):
 
     # Ponder trainer
     ponder_trainer = PonderTrainer(
+        ponder=ponder_model,
         denoiser=denoiser,
         schedule=schedule,
         N_super=args.supervision,
@@ -562,12 +597,21 @@ def cmd_train(args):
             if result is None:
                 program_idx = (program_idx + 1) % len(programs)
                 continue
-            batch, answer_mask = result
+
+            # Unpack: QAProgram returns 3-tuple, others return 2-tuple
+            ponder_x0 = None
+            if len(result) == 3:
+                batch, answer_mask, ponder_x0 = result
+            else:
+                batch, answer_mask = result
+
             x0 = batch.to(device)
             if answer_mask is not None:
                 answer_mask = answer_mask.to(device)
+            if ponder_x0 is not None:
+                ponder_x0 = ponder_x0.to(device)
 
-            is_reasoning = isinstance(program, (SudokuProgram, ArithmeticProgram))
+            is_reasoning = isinstance(program, (SudokuProgram, ArithmeticProgram, QAProgram))
 
             # Determine if this is a study or practice step
             if use_memory and memory_alternate > 0:
@@ -579,8 +623,10 @@ def cmd_train(args):
 
             if is_reasoning:
                 # --- Reasoning tasks: always use ponder deep supervision ---
+                # For QA: ponder sees question only, denoiser denoises answer
                 ponder_losses, memory = ponder_trainer.train_step(
                     x0, optimizer, memory, answer_mask=answer_mask,
+                    ponder_x0=ponder_x0,
                 )
                 ema.update(denoiser)
                 avg_loss = ponder_losses['LM']
@@ -613,7 +659,7 @@ def cmd_train(args):
                         answer_mask=answer_mask,
                         K=args.grpo_k,
                         sampling_steps=args.grpo_steps,
-                        use_ponder=True,
+                        ponder=ponder_model,
                         n_ponder=3,
                         verbose=(global_step % args.report_every == 0),
                     )
@@ -711,7 +757,7 @@ def cmd_train(args):
                         wiki_state = p.wiki_state()
                 log = "\n".join(training_log_lines)
                 log += f"\nsaved at step {global_step}"
-                save_checkpoint(ckpt_path, denoiser, config, log, wiki_state, ema=ema)
+                save_checkpoint(ckpt_path, denoiser, config, log, wiki_state, ema=ema, ponder=ponder_model)
 
             if global_step % args.sample_every == 0:
                 denoiser.eval()
@@ -740,7 +786,7 @@ def cmd_train(args):
     for p in programs:
         if isinstance(p, WikipediaProgram):
             wiki_state = p.wiki_state()
-    save_checkpoint(ckpt_path, denoiser, config, log, wiki_state, ema=ema)
+    save_checkpoint(ckpt_path, denoiser, config, log, wiki_state, ema=ema, ponder=ponder_model)
     print(f"Done. {global_step} steps in {elapsed}.")
 
 
@@ -764,6 +810,15 @@ def cmd_eval(args):
         print(f"No checkpoint found at {ckpt_path}")
         sys.exit(1)
 
+    ponder_model = SRLMPonder(config).to(device)
+    ponder_path = ckpt_path / "ponder.pt"
+    if ponder_path.exists():
+        ponder_model.load_state_dict(
+            torch.load(ponder_path, map_location=device, weights_only=True))
+        print(f"Loaded ponder from {ponder_path}")
+    else:
+        print("Warning: no ponder.pt found, ponder weights are random")
+
     if args.ema:
         ema_path = ckpt_path / "ema.pt"
         if ema_path.exists():
@@ -775,11 +830,20 @@ def cmd_eval(args):
             print("Warning: --ema requested but no ema.pt found")
 
     denoiser.eval()
-    print(f"Parameters: {param_count(denoiser):,}")
+    ponder_model.eval()
+    print(f"Denoiser params: {param_count(denoiser):,}")
+    print(f"Ponder params:   {param_count(ponder_model):,}")
 
-    memory = None
+    # Session-persistent memory
+    memory = denoiser.init_memory(1, device)
+    n_ponder = args.n_ponder
     puzzles = None
     solutions = None
+
+    print(f"\nPonder reads your input into memory, denoiser generates response.")
+    print(f"Memory persists across the session ({config.gmem.num_slots} slots).")
+    print(f"Commands: !reset  !sudoku  !ponder N  (empty line = free generate)")
+    print()
 
     while True:
         try:
@@ -789,8 +853,15 @@ def cmd_eval(args):
             break
 
         if query_text.strip() == "!reset":
-            memory = None
+            memory = denoiser.init_memory(1, device)
             print("Memory reset.")
+            continue
+
+        if query_text.strip().startswith("!ponder"):
+            parts = query_text.strip().split()
+            if len(parts) >= 2:
+                n_ponder = int(parts[1])
+            print(f"Ponder iterations: {n_ponder}")
             continue
 
         if query_text.strip() == "!sudoku":
@@ -817,14 +888,27 @@ def cmd_eval(args):
             print(puzzle_grid.replace('0', '.'))
             print()
 
-            sol_tokens = torch.frombuffer(
-                bytearray(solution_grid.encode()), dtype=torch.uint8).to(torch.int32)
+            # Ponder reads the puzzle into memory
             puz_tokens = torch.frombuffer(
                 bytearray(puzzle_grid.encode()), dtype=torch.uint8).to(torch.int32)
+            sol_tokens = torch.frombuffer(
+                bytearray(solution_grid.encode()), dtype=torch.uint8).to(torch.int32)
+
+            ponder_input = torch.full((1, seq_len), ord(' '), dtype=torch.int32, device=device)
+            p_len = min(len(puz_tokens), seq_len)
+            ponder_input[0, :p_len] = puz_tokens[:p_len].to(device)
+
+            with torch.no_grad():
+                h_p, _, _, _ = ponder_model.get_front(ponder_input, memory)
+                z_H, z_L = ponder_model.init_states(h_p)
+                for _ in range(n_ponder):
+                    z_H, z_L, _ = ponder_model.ponder(h_p, z_H, z_L)
+                memory = ponder_model(z_H, memory)
+
+            # Denoiser generates with clue clamping
             clue_mask = (puz_tokens != ord('0'))
             clue_values = sol_tokens.clone()
 
-            # Conditional sampling: clamp clue positions each step
             sampler_obj = Sampler(schedule, MASK_TOKEN, VOCAB_SIZE)
             xt, stepper = sampler_obj(1, seq_len, device, args.steps)
             q_len = min(len(clue_values), seq_len)
@@ -834,7 +918,7 @@ def cmd_eval(args):
 
             with torch.no_grad():
                 for step in stepper:
-                    logits, memory, _ = denoiser(xt, step.t, memory)
+                    logits, _, _ = denoiser(xt, step.t, memory)
                     x0 = step.propose_x0(xt, logits)
                     xt = step.reverse_step(xt, x0)
                     xt[0, :q_len] = torch.where(cm, cv, xt[0, :q_len])
@@ -863,25 +947,40 @@ def cmd_eval(args):
         query = from_text(query_text)
 
         if query is not None and len(query) > 0:
-            # Conditional sampling: clamp query prefix each step
-            q = query.to(device)
-            q_len = min(len(q), seq_len)
+            # Step 1: Ponder reads user input into session memory
+            ponder_input = torch.full((1, seq_len), ord(' '), dtype=torch.int32, device=device)
+            q_len = min(len(query), seq_len)
+            ponder_input[0, :q_len] = query[:q_len].to(device)
 
+            with torch.no_grad():
+                h_p, _, _, _ = ponder_model.get_front(ponder_input, memory)
+                z_H, z_L = ponder_model.init_states(h_p)
+                for _ in range(n_ponder):
+                    z_H, z_L, _ = ponder_model.ponder(h_p, z_H, z_L)
+                memory = ponder_model(z_H, memory)
+
+            # Step 2: Denoiser generates from all-masked using enriched memory
             sampler_obj = Sampler(schedule, MASK_TOKEN, VOCAB_SIZE)
             xt, stepper = sampler_obj(1, seq_len, device, args.steps)
-            xt[0, :q_len] = q[:q_len]
 
             with torch.no_grad():
                 for step in stepper:
-                    logits, memory, _ = denoiser(xt, step.t, memory)
+                    logits, _, _ = denoiser(xt, step.t, memory)
                     x0 = step.propose_x0(xt, logits)
                     xt = step.reverse_step(xt, x0)
-                    xt[0, :q_len] = q[:q_len]
 
             print(as_text(xt[0]))
         else:
-            xt, memory = sample(denoiser, schedule, batch_size=1, seq_len=seq_len,
-                                num_steps=args.steps, memory=memory, device=device)
+            # Empty input: free generate from current memory state
+            sampler_obj = Sampler(schedule, MASK_TOKEN, VOCAB_SIZE)
+            xt, stepper = sampler_obj(1, seq_len, device, args.steps)
+
+            with torch.no_grad():
+                for step in stepper:
+                    logits, _, _ = denoiser(xt, step.t, memory)
+                    x0 = step.propose_x0(xt, logits)
+                    xt = step.reverse_step(xt, x0)
+
             print(as_text(xt[0]))
 
 
@@ -911,6 +1010,7 @@ def main():
     p_train.add_argument("--large", action="store_true")
     p_train.add_argument("--hidden-dim", type=int, default=None, dest="hidden_dim")
     p_train.add_argument("--num-heads", type=int, default=None, dest="num_heads")
+    p_train.add_argument("--num-slots", type=int, default=None, dest="num_slots")
     p_train.add_argument("--seq-len", type=int, default=None, dest="seq_len")
     # Training
     p_train.add_argument("--batch-size", type=int, default=32, dest="batch_size")
@@ -931,6 +1031,13 @@ def main():
                          help="Alternate study/practice every N steps (default: 50)")
     p_train.add_argument("--memory-refresh", type=int, default=200, dest="memory_refresh",
                          help="Re-encode replay buffer every N steps (default: 200)")
+    # GRPO (for reasoning tasks)
+    p_train.add_argument("--grpo-every", type=int, default=0, dest="grpo_every",
+                         help="GRPO reinforcement every N steps on reasoning tasks (0=off)")
+    p_train.add_argument("--grpo-k", type=int, default=4, dest="grpo_k",
+                         help="GRPO candidates per prompt (default: 4)")
+    p_train.add_argument("--grpo-steps", type=int, default=32, dest="grpo_steps",
+                         help="GRPO sampling steps (default: 32)")
     # Program interleaving
     p_train.add_argument("--interleave", type=int, default=0,
                          help="Switch programs every N steps (0=sequential)")
@@ -941,6 +1048,8 @@ def main():
     p_eval.add_argument("--steps", type=int, default=64)
     p_eval.add_argument("--seq-len", type=int, default=None, dest="seq_len")
     p_eval.add_argument("--ema", action="store_true")
+    p_eval.add_argument("--n-ponder", type=int, default=3, dest="n_ponder",
+                         help="Ponder iterations per input (default: 3)")
 
     args = parser.parse_args()
     if args.tf32:

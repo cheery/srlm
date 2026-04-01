@@ -133,8 +133,8 @@ def grpo_step(
     epochs=5,
     beta_dgpo=1.0,       # DGPO sigmoid temperature
     t_min=1e-4,
-    use_ponder=False,    # use ponder-enhanced forward
-    n_ponder=3,          # ponder iterations when use_ponder=True
+    ponder=None,         # SRLMPonder for ponder-enhanced forward (None=off)
+    n_ponder=3,          # ponder iterations when ponder is provided
 ):
     """DGPO-style GRPO update for masked discrete diffusion.
 
@@ -144,9 +144,9 @@ def grpo_step(
     4. Cache reference CE loss (model before optimization)
     5. Optimize with DGPO loss: sigma(group_drift) * advantage * CE_loss
 
-    When use_ponder=True, both sampling and loss computation use the
-    ponder-enhanced forward path (front → ponder → write-back → re-read
-    → behind), so the PonderBlock gets GRPO reward signal gradients.
+    When ponder is provided, both sampling and loss computation use the
+    ponder-enhanced forward path (ponder reads clean → denoiser reads
+    enriched memory), so the PonderBlock gets GRPO reward signal gradients.
     """
     B, L = prompt_batch.shape
     n_vocab = denoiser.cfg.vocab_size
@@ -159,9 +159,10 @@ def grpo_step(
     visible = (prompt_batch != mask_id)
 
     # Forward function: plain or ponder-enhanced
-    def _forward(xt, t, mem):
-        if use_ponder:
-            return ponder_forward(denoiser, xt, t, mem, n_ponder=n_ponder)
+    def _forward(x0, xt, t, mem):
+        if ponder is not None:
+            return ponder_forward(ponder, denoiser, x0, xt, t, mem,
+                                  n_ponder=n_ponder)
         else:
             return denoiser(xt, t, mem)
 
@@ -179,10 +180,13 @@ def grpo_step(
     xt, stepper = sampler(B * K, L, device, sampling_steps)
 
     with torch.no_grad():
+        # For sampling with ponder: use prompt as clean context
+        clean_expanded = clean_batch.repeat_interleave(K, dim=0)
         for s in stepper:
             # Clamp visible (query) positions each step
             xt = torch.where(visible_expanded, prompt_expanded, xt)
-            logits, memory_expanded, _ = _forward(xt, s.t, memory_expanded)
+            logits, memory_expanded, _ = _forward(
+                clean_expanded, xt, s.t, memory_expanded)
             x0 = s.propose_x0(xt, logits)
             xt = s.reverse_step(xt, x0)
 
@@ -235,7 +239,7 @@ def grpo_step(
                 # Keep visible/query positions clean
                 xt_k = torch.where(visible, prompt_batch, xt_k)
 
-                logits_k, _, _ = _forward(xt_k, t_k, memory)
+                logits_k, _, _ = _forward(candidate_k, xt_k, t_k, memory)
                 ref_loss = loss_fn(logits_k, candidate_k, is_masked_k)
 
                 ep_data.append({
@@ -259,7 +263,7 @@ def grpo_step(
         losses_k = []
         for k in range(K):
             c = ref_cache[ep][k]
-            logits_k, _, _ = _forward(c['xt'], c['t'], memory)
+            logits_k, _, _ = _forward(c['candidate'], c['xt'], c['t'], memory)
             loss_k = loss_fn(logits_k, c['candidate'], c['is_masked'])
             losses_k.append(loss_k)
 
@@ -276,13 +280,15 @@ def grpo_step(
         for k in range(K):
             idx = torch.arange(B, device=device) * K + k
             adv_k = advantages[idx].mean()
-            weighted_sum = weighted_sum + group_weights.detach() * adv_k * losses_k[k]
+            weighted_sum = weighted_sum + (group_weights.detach() * adv_k * losses_k[k]).sum()
 
         weighted_sum.backward()
         total_loss += weighted_sum.item()
         n_steps += 1
 
         torch.nn.utils.clip_grad_norm_(denoiser.parameters(), grad_clip)
+        if ponder is not None:
+            torch.nn.utils.clip_grad_norm_(ponder.parameters(), grad_clip)
         optimizer.step()
 
     # Detach memory for return

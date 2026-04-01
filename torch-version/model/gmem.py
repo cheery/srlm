@@ -159,37 +159,70 @@ class GatedEnhancement(nn.Module):
         g = torch.sigmoid(self.gate(torch.cat([hidden_states, decoded_memory], dim=-1)))
         return hidden_states + g * decoded_memory
 
+class LatentMemoryTerminal(nn.Module):
+    """Write-only memory module: encodes hidden states and writes to memory via
+    cross-attention + GRU gated update. No retrieval/read path."""
 
-class LatentMemoryBank(nn.Module):
-    """The full memory module: encoder, decoder, cross-attention, gated update,
-    relevance retriever, and gated enhancement."""
-
-    def __init__(
-        self,
-        hidden_dim: int,
-        memory_dim: int = 256,
-        num_slots: int = 1024,
-        num_heads: int = 4,
-    ):
+    def __init__(self, hidden_dim: int, memory_dim: int = 256, num_heads: int = 4):
         super().__init__()
-        self.num_slots = num_slots
         self.memory_dim = memory_dim
+        self.encoder = MemoryEncoder(hidden_dim, memory_dim)
+        self.cross_attn = CrossAttention(memory_dim, num_heads)
+        self.gated_update = GatedUpdate(memory_dim)
 
-        # Learnable memory slots
-        self.memory_slots = nn.Parameter(torch.randn(1, num_slots, memory_dim) * 0.02)
+    def forward(
+        self,
+        hidden_states: torch.Tensor,   # (batch, seq_len, hidden_dim)
+        memory: torch.Tensor,  # (batch, num_slots, memory_dim)
+    ) -> torch.Tensor:
+        encoded = self.encoder(hidden_states)  # (B, T, D_m)
+        m_attended = self.cross_attn(memory, encoded, encoded)
+        updated_memory = self.gated_update(memory, m_attended)
+        return updated_memory
 
+class LatentMemoryIn(nn.Module):
+    """The part of memory bank that retrieves from memory."""
+    def __init__(self, hidden_dim: int, memory_dim: int = 256, num_heads: int = 4):
+        super().__init__()
+        self.memory_dim = memory_dim
         # Sub-modules
         self.encoder = MemoryEncoder(hidden_dim, memory_dim)
         self.decoder = MemoryDecoder(memory_dim, hidden_dim)
-        self.cross_attn = CrossAttention(memory_dim, num_heads)
-        self.gated_update = GatedUpdate(memory_dim)
         self.retriever = RelevanceRetriever(memory_dim)
         self.enhancement = GatedEnhancement(hidden_dim)
 
     def forward(
         self,
         hidden_states: torch.Tensor,   # (batch, seq_len, hidden_dim)
-        memory: torch.Tensor | None = None,  # (batch, num_slots, memory_dim) or None
+        memory: torch.Tensor,  # (batch, num_slots, memory_dim)
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Encode hidden states into memory space
+        encoded = self.encoder(hidden_states)  # (B, T, D_m)
+
+        # --- Retrieval ---
+        retrieved, importance_scores = self.retriever(encoded, memory)
+        # retrieved: (B, 1, D_m), importance_scores: (B, S)
+
+        # Decode and inject into hidden states
+        decoded = self.decoder(retrieved)  # (B, 1, D_h)
+        enhanced_hidden = self.enhancement(hidden_states, decoded)
+
+        return enhanced_hidden, importance_scores
+
+class LatentMemoryBank(LatentMemoryIn):
+    """The full memory module: encoder, decoder, cross-attention, gated update,
+    relevance retriever, and gated enhancement."""
+
+    def __init__(self, hidden_dim: int, memory_dim: int = 256, num_heads: int = 4):
+        super().__init__(hidden_dim, memory_dim, num_heads)
+        # Sub-modules
+        self.cross_attn = CrossAttention(memory_dim, num_heads)
+        self.gated_update = GatedUpdate(memory_dim)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,   # (batch, seq_len, hidden_dim)
+        memory: torch.Tensor,  # (batch, num_slots, memory_dim)
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Returns:
@@ -197,12 +230,6 @@ class LatentMemoryBank(nn.Module):
             updated_memory: consolidated memory for next step (batch, num_slots, memory_dim)
             importance_scores: raw scores for loss computation (batch, num_slots)
         """
-        B = hidden_states.size(0)
-
-        # Initialize memory from learned slots if not provided
-        if memory is None:
-            memory = self.memory_slots.expand(B, -1, -1)
-
         # Encode hidden states into memory space
         encoded = self.encoder(hidden_states)  # (B, T, D_m)
 
