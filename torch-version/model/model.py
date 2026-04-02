@@ -409,8 +409,8 @@ def ponder_forward(ponder, denoiser, x0, xt, t, memory=None, n_ponder=3):
     memory = ponder(z_H, memory)
 
     # Denoiser uses enriched memory
-    logits, _, _ = denoiser(xt, t, memory)
-    return logits, memory, importance_scores
+    logits, memory, importance_scores2 = denoiser(xt, t, memory)
+    return logits, memory, importance_scores, importance_scores2
 
 
 # ============================================================
@@ -483,14 +483,7 @@ class PonderTrainer:
         # What ponder sees: question only (if provided) or full x0
         ponder_input = ponder_x0 if ponder_x0 is not None else x0
 
-        # Perturb x0 once — same noising for all segments
         loss_fn = MDLMLoss(self.schedule, mask_id, t_min=t_min)
-        xt, t, is_masked = loss_fn.perturb(x0, answer_mask=answer_mask)
-
-        # Denoiser front layers once (shared across segments)
-        h_front, c, cos, sin = denoiser.input(xt, t)
-        for layer in denoiser.front_layers:
-            h_front = layer(h_front, c, cos, sin)
 
         # Ponder front once: embed ponder_input, read from memory
         h_ponder, _, _, importance_scores = ponder.get_front(ponder_input, memory)
@@ -501,15 +494,18 @@ class PonderTrainer:
         ]}
 
         for seg in range(self.N_super):
+            # Fresh perturbation each segment — different t, different masks
+            xt, t, is_masked = loss_fn.perturb(x0, answer_mask=answer_mask)
+
             # PonderBlock iteration
+            h_ponder, _, _, importance_scores = ponder.get_front(ponder_input, memory)
             z_H_new, z_L_new, q_values = ponder.ponder(h_ponder, z_H, z_L)
 
             # Write ponder result to memory
-            memory_updated = ponder(z_H_new, memory)
+            memory = ponder(z_H_new, memory)
 
-            # Denoiser reads enriched memory → logits
-            h, _, _ = denoiser.latent_memory(h_front, memory_updated)
-            logits = denoiser.get_behind(h, c, cos, sin)
+            # Full denoiser forward — matches ponder_forward inference path
+            logits, memory, importance_scores2 = denoiser(xt, t, memory)
 
             # --- Losses ---
             losses = {}
@@ -522,11 +518,8 @@ class PonderTrainer:
             losses["BCE"] = F.binary_cross_entropy(q_values, target)
 
             # Memory regularization
-            if importance_scores is not None:
-                mem_loss_fn = MemoryLoss()
-                losses["mem"] = mem_loss_fn(importance_scores)
-            else:
-                losses["mem"] = torch.tensor(0.0, device=device)
+            mem_loss_fn = MemoryLoss()
+            losses["mem"] = mem_loss_fn(importance_scores) + mem_loss_fn(importance_scores2)
 
             losses["rep"] = repulsion_loss(z_H_new)
 
@@ -548,18 +541,19 @@ class PonderTrainer:
                 + self.lambda_rep * losses["rep"]
                 + self.lambda_equil * losses["equil"]
                 + self.lambda_RH_stable * losses["RH_stable"]
-            ) / self.N_super
+            )
 
-            total.backward(retain_graph=(seg < self.N_super - 1))
+            total.backward()
 
-            # Detach for next segment
+            # Detach latent states for next segment (deep supervision)
+            # Memory stays attached — lets gradients flow across segments
             z_H = z_H_new.detach()
             z_L = z_L_new.detach()
-            memory = memory_updated.detach()
+            memory = memory.detach()
 
             for k, v in losses.items():
                 all_losses[k] += v.item()
-            all_losses["total"] += total.item() * self.N_super
+            all_losses["total"] += total.item()
 
             # ACT early stopping
             with torch.no_grad():
@@ -567,10 +561,17 @@ class PonderTrainer:
                 if q_mean[0] > q_mean[1] and seg >= 1:
                     break
 
+        # Scale gradients by 1/n_run so effective LR is independent of
+        # how many segments actually ran (fixes early ACT stopping)
+        n_run = seg + 1
+        for p in list(denoiser.parameters()) + list(ponder.parameters()):
+            if p.grad is not None:
+                p.grad /= n_run
+
         torch.nn.utils.clip_grad_norm_(denoiser.parameters(), 1.0)
         torch.nn.utils.clip_grad_norm_(ponder.parameters(), 1.0)
         optimizer.step()
         optimizer.zero_grad()
 
-        n_run = seg + 1
+        memory = memory.detach()
         return {k: v / n_run for k, v in all_losses.items()}, memory

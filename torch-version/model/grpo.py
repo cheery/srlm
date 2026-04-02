@@ -161,8 +161,9 @@ def grpo_step(
     # Forward function: plain or ponder-enhanced
     def _forward(x0, xt, t, mem):
         if ponder is not None:
-            return ponder_forward(ponder, denoiser, x0, xt, t, mem,
+            logits, memory, im1, im2 = ponder_forward(ponder, denoiser, x0, xt, t, mem,
                                   n_ponder=n_ponder)
+            return logits, memory, im1
         else:
             return denoiser(xt, t, mem)
 

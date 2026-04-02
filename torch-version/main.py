@@ -27,7 +27,7 @@ import torch.optim as optim
 from model.model import (
     SRLMConfig, GMemConfig, PonderConfig,
     SRLMDenoiser, SRLMEnergyModel, SRLMPonder,
-    mdlm_loss, nce_loss, sample, ponder_forward, PonderTrainer,
+    mdlm_loss, nce_loss, sample, PonderTrainer,
 )
 from model.edlm import LogLinearSchedule, Sampler
 from model.ema import EMA
@@ -276,7 +276,13 @@ class WikipediaProgram:
 
 
 class ArithmeticProgram:
-    """N+M=Y facts. Question shown, answer masked."""
+    """N+M=Y facts. Question shown, answer masked.
+
+    Returns 3-tuple: (full_tokens, answer_mask, prompt_tokens)
+      - full_tokens: "N+M=Y" (denoiser target)
+      - answer_mask: True at answer digit positions
+      - prompt_tokens: "N+M=" only (ponder input)
+    """
 
     def __init__(self, seq_len, batch_size, max_steps=None, max_operand=99):
         self.seq_len = seq_len
@@ -292,6 +298,7 @@ class ArithmeticProgram:
         if self.done():
             return None
         batch = torch.full((self.batch_size, self.seq_len), ord(' '), dtype=torch.int32)
+        prompt_batch = torch.full((self.batch_size, self.seq_len), ord(' '), dtype=torch.int32)
         answer_mask = torch.zeros(self.batch_size, self.seq_len, dtype=torch.bool)
         for i in range(self.batch_size):
             n = torch.randint(0, self.max_operand + 1, ()).item()
@@ -299,13 +306,15 @@ class ArithmeticProgram:
             prompt = f"{n}+{m}="
             answer = f"{n+m}"
             full = prompt + answer
-            tokens = torch.frombuffer(bytearray(full.encode()), dtype=torch.uint8).to(torch.int32)
-            L = min(len(tokens), self.seq_len)
-            batch[i, :L] = tokens[:L]
-            p_len = len(prompt.encode())
-            answer_mask[i, p_len:L] = True
+            full_tok = torch.frombuffer(bytearray(full.encode()), dtype=torch.uint8).to(torch.int32)
+            prompt_tok = torch.frombuffer(bytearray(prompt.encode()), dtype=torch.uint8).to(torch.int32)
+            L = min(len(full_tok), self.seq_len)
+            Lp = min(len(prompt_tok), self.seq_len)
+            batch[i, :L] = full_tok[:L]
+            prompt_batch[i, :Lp] = prompt_tok[:Lp]
+            answer_mask[i, Lp:L] = True
         self.step_count += 1
-        return batch, answer_mask
+        return batch, answer_mask, prompt_batch
 
     def description(self):
         return f"arithmetic({self.max_steps or 'inf'}, done={self.step_count})"
@@ -918,7 +927,7 @@ def cmd_eval(args):
 
             with torch.no_grad():
                 for step in stepper:
-                    logits, _, _ = denoiser(xt, step.t, memory)
+                    logits, memory, _ = denoiser(xt, step.t, memory)
                     x0 = step.propose_x0(xt, logits)
                     xt = step.reverse_step(xt, x0)
                     xt[0, :q_len] = torch.where(cm, cv, xt[0, :q_len])
@@ -965,7 +974,7 @@ def cmd_eval(args):
 
             with torch.no_grad():
                 for step in stepper:
-                    logits, _, _ = denoiser(xt, step.t, memory)
+                    logits, memory, _ = denoiser(xt, step.t, memory)
                     x0 = step.propose_x0(xt, logits)
                     xt = step.reverse_step(xt, x0)
 
@@ -977,7 +986,7 @@ def cmd_eval(args):
 
             with torch.no_grad():
                 for step in stepper:
-                    logits, _, _ = denoiser(xt, step.t, memory)
+                    logits, memory, _ = denoiser(xt, step.t, memory)
                     x0 = step.propose_x0(xt, logits)
                     xt = step.reverse_step(xt, x0)
 
